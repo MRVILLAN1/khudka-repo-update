@@ -1,0 +1,110 @@
+VILLAN BOT - SPEED OPTIMIZATION NOTES (Hinglish)
+================================================
+
+Tumhare purane code me speed ki 3 badi problems thi:
+
+1. SEQUENTIAL LOOP: Ek file download -> upload -> phir agli file.
+   Beech me har file par 2 second ka sleep(2) bhi tha.
+   150 files = 150 x 2 sec = 5 minute sirf waiting me waste!
+
+2. SEMAPHORE(2) bekaar tha: poore batch loop ko ek baar me wrap kiya
+   tha, isliye parallel me kuch hota hi nahi tha.
+
+3. Har update par print karne wala packet_sniffer logger noise badha
+   raha tha (speed par halka asar + logs ka kharcha).
+
+IS OPTIMIZED VERSION ME KYA BADLA:
+-----------------------------------
+- PARALLEL_TASKS=3 (default): ab 3 files EK SAATH download/upload hongi.
+  Env var se 2-5 tak set kar sakte ho. 3 safe sweet spot hai.
+- sleep(2) hata diya: FloodWait aayega to code khud wait karega.
+- Har file ke liye alag temp folder: parallel me same naam wali
+  files aapas me overwrite nahi karengi.
+- uvloop add kiya: Linux par asyncio ~2x tez hota hai.
+- /cancel ab sach me kaam karta hai (beech me batch rok deta hai).
+- packet_sniffer hata diya.
+- Progress card me parse_mode fix (pehle **bold** raw text dikhta tha).
+- voice / video_note support add kiya.
+- Python 3.11-slim image (3.10 se thoda tez).
+
+KOYEB DEPLOY CHECKLIST (speed ke liye sabse zaroori):
+-----------------------------------------------------
+1. GitHub par push karo, Koyeb me "Deploy from GitHub" -> Builder: Dockerfile.
+2. REGION: fra (Frankfurt) chuno. Telegram ke zyadatar DC Europe me
+   hain, Frankfurt se latency sabse kam milegi = tez speed.
+3. INSTANCE: Free "Eco" instance par network/CPU throttle hota hai.
+   Kam se kam "Standard Nano" (paid) lo, tabhi stable 15 Mbps+ milega.
+   (15 Mbps = ~1.9 MB/s, ye modest target hai - paid instance par
+   aaram se achieve hota hai.)
+4. Health check: Path "/" , PORT env Koyeb khud set karta hai.
+5. Env variables: API_ID, API_HASH, BOT_TOKEN, SESSION_STRING,
+   PARALLEL_TASKS=3, PROGRESS_EVERY=5
+
+ORDER GUARANTEE (naya fix):
+--------------------------
+- DOWNLOAD parallel hota hai (tez), par UPLOAD hamesha original
+  order me ek-ek karke hota hai. Chhoti file pehle download ho
+  jaye to bhi delivery sequence nahi bigdegi.
+- asyncio.gather result hamesha input ke order me deta hai,
+  isliye sequence safe hai.
+- Files window-wise process hoti hain (PARALLEL_TASKS x 2),
+  taaki disk par zyada load na pade.
+
+SACH BATAUN TO:
+---------------
+- Code tumhara bottleneck hata sakta hai, par FINAL speed hamesha
+  (Koyeb server <-> Telegram DC) ke network par depend karegi.
+  Iski guarantee code se nahi di ja sakti.
+- Userbot wala account us private channel ka MEMBER hona chahiye.
+  Bot ko channel join karne ki zaroorat nahi hai (design pehle se sahi hai).
+- Bahut zyada PARALLEL_TASKS (6+) mat karna, Telegram FloodWait
+  de dega aur ulta slow ho jayega.
+
+===============================================================
+v40 — KYA BADLA (private sources ke liye GAME CHANGER)
+===============================================================
+1. TRANSFER FAST PATH (sabse bada win):
+   - Pehle: private channel ki har file download + re-upload hoti thi
+     (userbot ka file_id bot use nahi kar sakta -> MEDIA_EMPTY).
+   - Ab: userbot wahi file_id BOT ko PM kar deta hai (server-side,
+     instant), bot us message ko user tak COPY kar deta hai (instant).
+     Download/upload dono skip — na bandwidth kharch, na upload.GetFile
+     ke flood waits.
+   - Logs me "Transfer send failed" dikhe to bot username check karo.
+
+2. CHUNKED METADATA FETCH (FETCH_CHUNK, default 100):
+   - Pehle har message ka info lene 1 API call jati thi (100 files =
+     100 requests). Ab 100 files = 1 request. Kam requests = kam
+     FloodWait risk + kai second bachte hain har 100 files par.
+
+3. ADAPTIVE PACING:
+   - FAST_GAP (default 2s): instant delivery (file_id/copy) ke baad.
+   - SLOW_GAP (default 3s): download+upload wali file ke baad.
+   - Pehle har file ke baad flat 3s tha. Instant files ab tez niklengi.
+
+4. Bot API HTTP session REUSE:
+   - Pehle har call par naya TLS handshake; ab ek hi session.
+   - 1000 files ke batch me kai minute bachte hain.
+
+5. RAM/FREE PLAN (Koyeb Eco):
+   - workers 100 -> 16 per client (bot + userbots milkar 400+ threads
+     the; 512MB free instance par ye bhaari tha).
+   - sleep_threshold=60: 60s tak ke FloodWait khud absorb (pehle 10s
+     se bade wait par file FAIL ho jati thi).
+
+6. SECURITY / RESTRICTION SAFETY:
+   - Owner userbot fallback ab SIRF asli OWNER ke liye (OWNER_ID set
+     hona zaroori). Pehle open mode me stranger bhi owner ka account
+     use kar leta tha = owner account par ban/flood ka risk.
+   - Join-check 5 min cache + PEER_ID_INVALID par auto-retry (deploy
+     ke baad peer cache cold hota hai). UPDATES_CHANNEL me hamesha
+     @username use karo, numeric ID nahi.
+   - Force-join ab direct links par bhi lagta hai (pehle bypass tha).
+
+NAYE ENV VARS (sab optional):
+  FAST_GAP=2      instant file ke baad gap (sec)
+  SLOW_GAP=3      download/upload file ke baad gap (sec)
+  FETCH_CHUNK=100 ek call me kitne messages ka metadata (max 200)
+
+BOT API UPLOAD BUG FIX: file object form me daalne se pehle close ho
+jaata tha (post fail hota tha) — ab pehle bytes padhe jaate hain.
