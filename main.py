@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v40"
+VERSION = "v44"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -207,10 +207,6 @@ app = Client(
     sleep_threshold=60,
 )
 
-# Bot ka username — main() me set hota hai. Private source wali files ke
-# "transfer fast path" me userbot isse hi bot ko file bhejta hai.
-BOT_USERNAME = None
-
 user = None
 if SESSION_STRING and len(SESSION_STRING) > 30:
     user = Client(
@@ -310,6 +306,12 @@ async def _logout_user(uid):
             await c.disconnect()
         except Exception:
             pass
+    # v44: is user ke cached media sessions bhi mar jayenge — saaf kar do
+    # (warna stale sessions cache me padi rahengi)
+    try:
+        _evict_media_sessions(c)
+    except Exception:
+        pass
     sessions = _load_json(SESSIONS_FILE, {})
     if str(uid) in sessions:
         del sessions[str(uid)]
@@ -732,7 +734,7 @@ def _info_from_msg(target_msg, msg_id):
     return info
 
 
-async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
+async def download_file_classic(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
     """Slow path: file ko disk par download karo (settings ya file_id fail par).
     prog_msg = alag progress message (pinned status_msg se alag)."""
     target_msg = info.get("target_msg")
@@ -777,6 +779,204 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
     except Exception as e:
         print(f"Download error on {msg_id}: {e}", flush=True)
         return None
+
+
+
+# --- v41 MULTI-CONNECTION DOWNLOAD (v40 se tagra change) ---
+# Rule intact: file EK BAAR ME EK HI download hoti hai (sequential batch
+# order same hai) — lekin us EK file ke 1MB parts ek saath (MULTI_PARTS
+# concurrent GetFile requests, ek hi media session par) aate hain.
+# Single-connection download latency-bound hota hai (har 1MB part ke liye
+# round-trip wait), isliye concurrent parts se throughput kai guna badh
+# sakta hai. Koi bhi error -> classic download (fallback), to worst case
+# v40 jitni speed, kabhi file fail nahi hoti is wajah se.
+MULTI_PARTS = max(1, min(8, int(os.environ.get("MULTI_PARTS", "6"))))
+MULTI_MIN_SIZE = int(os.environ.get("MULTI_MIN_SIZE", str(10 * 1024 * 1024)))
+MULTI_CHUNK = 1024 * 1024  # 1MB parts (Pyrogram ke get_file jaisa)
+
+# v44 SPEED: media DC session CACHE. Pehle HAR file par naya media session
+# + auth key exchange hota tha (~1-3 sec/file sirf setup me). Ab ek hi
+# session ban kar reuse hoti hai — 100 files ke batch me 2-5 minute bachte
+# hain sirf setup me. Session kharab ho jaye to evict karke agli file me
+# naya ban jata hai (fallback classic waise hi hai).
+_MEDIA_SESSION_CACHE = {}  # (id(client), dc_id) -> Session
+
+
+async def _stop_session_quietly(sess):
+    try:
+        await sess.stop()
+    except Exception:
+        pass
+
+
+def _evict_media_sessions(user_client, dc_id=None):
+    """Cache se session(s) hatao (stale/broken hone par)."""
+    for k in [k for k in list(_MEDIA_SESSION_CACHE)
+              if k[0] == id(user_client) and (dc_id is None or k[1] == dc_id)]:
+        sess = _MEDIA_SESSION_CACHE.pop(k)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_stop_session_quietly(sess))
+        except Exception:
+            pass
+
+
+async def _get_media_session(user_client, dc_id):
+    """Is client+DC ka (cached) media session lao — pehli baar banega."""
+    from pyrogram import raw as _raw
+    from pyrogram.session import Auth, Session
+    key = (id(user_client), dc_id)
+    cached = _MEDIA_SESSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    main_dc = await user_client.storage.dc_id()
+    test_mode = await user_client.storage.test_mode()
+    if dc_id != main_dc:
+        auth_key = await Auth(user_client, dc_id, test_mode).create()
+    else:
+        auth_key = await user_client.storage.auth_key()
+    session = Session(user_client, dc_id, auth_key, test_mode, is_media=True)
+    await session.start()
+    if dc_id != main_dc:
+        exported = await user_client.invoke(
+            _raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+        await session.invoke(
+            _raw.functions.auth.ImportAuthorization(
+                id=exported.id, bytes=exported.bytes))
+    _MEDIA_SESSION_CACHE[key] = session
+    return session
+
+
+async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
+    """Ek file ke parts concurrent fetch karo. Success par dl_path,
+    kisi bhi failure par exception (caller classic fallback lega)."""
+    from pyrogram import raw as _raw
+    from pyrogram.file_id import FileId, FileType
+
+    file_id_str = info.get("file_id")
+    file_size = info.get("file_size", 0) or 0
+    msg_id = info["msg_id"]
+    if not file_id_str or file_size <= 0:
+        raise ValueError("multi: no file_id/size")
+    fid = FileId.decode(file_id_str)
+    if fid.file_type == FileType.CHAT_PHOTO:
+        raise ValueError("multi: chat photo not supported")
+    if fid.file_type == FileType.PHOTO:
+        location = _raw.types.InputPhotoFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    else:
+        location = _raw.types.InputDocumentFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+
+    dc_id = fid.dc_id
+    # v44: cached session (per-file session start ka ~1-3s overhead gaya)
+    session = await _get_media_session(user_client, dc_id)
+    tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
+    info["tmpdir"] = tmpdir
+    dl_path = os.path.join(tmpdir, info["file_name"])
+    try:
+        n_parts = (file_size + MULTI_CHUNK - 1) // MULTI_CHUNK
+        downloaded = [0]
+        start_time = time.time()
+        last_update = [time.time()]
+        label = f"📥 Downloading • ID `{msg_id}`"
+        f = open(dl_path, "wb")
+        try:
+            for wave_start in range(0, n_parts, MULTI_PARTS):
+                wave = list(range(
+                    wave_start, min(wave_start + MULTI_PARTS, n_parts)))
+
+                async def _fetch_part(p):
+                    offset = p * MULTI_CHUNK
+                    for attempt in range(3):
+                        try:
+                            r = await session.invoke(
+                                _raw.functions.upload.GetFile(
+                                    location=location, offset=offset,
+                                    limit=MULTI_CHUNK),
+                                sleep_threshold=60)
+                            break
+                        except FloodWait as e:
+                            if attempt == 2:
+                                raise
+                            await asyncio.sleep(e.value + 1)
+                    if isinstance(r, _raw.types.upload.File):
+                        return p, r.bytes
+                    raise RuntimeError(
+                        "multi: unexpected response "
+                        f"{type(r).__name__} (CDN redirect -> classic)")
+
+                results = await asyncio.gather(
+                    *[_fetch_part(p) for p in wave])
+                for p, data in sorted(results):
+                    f.seek(p * MULTI_CHUNK)
+                    f.write(data)
+                    downloaded[0] += len(data)
+                if prog_msg is not None:
+                    try:
+                        await progress_bar(
+                            min(downloaded[0], file_size), file_size,
+                            prog_msg, start_time, last_update, label,
+                            stats, uid, bot_client)
+                    except Exception:
+                        pass
+        finally:
+            f.close()
+        if os.path.getsize(dl_path) != file_size:
+            raise RuntimeError(
+                f"multi: size mismatch {os.path.getsize(dl_path)} "
+                f"!= {file_size}")
+        return dl_path
+    except BaseException as e:
+        # FloodWait transient hai — session cache me hi rehne do. Baaki
+        # failure par session stale ho sakta hai, evict kar do.
+        if not isinstance(e, FloodWait):
+            _evict_media_sessions(user_client, dc_id)
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
+
+
+async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
+    """v41 wrapper: pehle multi-connection download try karo, fail par classic.
+    File order abhi bhi sequential hai — sirf ek file ke parts parallel aate hain."""
+    msg_id = info.get("msg_id")
+    if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
+            and info.get("file_id")
+            and (info.get("file_size", 0) or 0) >= MULTI_MIN_SIZE):
+        try:
+            dl_path = await _download_multi(
+                user_client, info, prog_msg, stats, uid, bot_client)
+            # classic jaisa tail: photo extension fix + video thumb
+            if info.get("kind") == "photo" and not dl_path.lower().endswith(
+                    (".jpg", ".jpeg", ".png", ".webp")):
+                try:
+                    os.rename(dl_path, dl_path + ".jpg")
+                    dl_path = dl_path + ".jpg"
+                except Exception:
+                    pass
+            info["file_path"] = dl_path
+            target_msg = info.get("target_msg")
+            if target_msg and target_msg.video and target_msg.video.thumbs:
+                try:
+                    info["thumb_path"] = await user_client.download_media(
+                        target_msg.video.thumbs[0].file_id,
+                        file_name=os.path.join(info["tmpdir"], "thumb.jpg"))
+                except Exception:
+                    info["thumb_path"] = None
+            print(f"Multi download OK ({msg_id}): {info.get('file_size', 0)} "
+                  f"bytes, {MULTI_PARTS} parts/file", flush=True)
+            return dl_path
+        except Exception as e:
+            print(f"Multi download fail ({msg_id}), classic par ja raha: {e}",
+                  flush=True)
+    return await download_file_classic(
+        user_client, info, prog_msg, stats, uid, bot_client)
 
 
 def _needs_file(s, info):
@@ -1163,60 +1363,8 @@ async def _direct_fast(client, dest_chat, group_id, topic_id, kind, file_id, cap
         print(f"Direct fast path failed ({info['msg_id']}): {e}", flush=True)
         return False
     await _fast_group_copy(client, group_id, topic_id, kind, file_id, cap, info)
+    print(f"⚡ INSTANT (direct) msg {info['msg_id']}", flush=True)
     return True
-
-
-async def _transfer_fast(client, userbot, dest_chat, group_id, topic_id,
-                         kind, file_id, cap, info):
-    """v40 TRANSFER FAST PATH (private sources ke liye sabse bada speed win).
-    Problem: userbot ka fetch kiya file_id BOT use nahi kar sakta (MEDIA_EMPTY),
-    isliye har private file download+upload hoti thi (minits lagte the +
-    upload.GetFile flood waits userbot par padte the).
-    Trick: userbot wahi file_id BOT ke PM me bhej deta hai (server-side,
-    instant — koi download nahi), phir bot us message ko user tak COPY kar
-    deta hai (wo bhi server-side instant). Copy me bot ka apna file_id ban
-    jata hai, jisse topic me bhi instant copy hota hai. Returns True/False."""
-    if not BOT_USERNAME or userbot is None:
-        return False
-    # 1) userbot file_id BOT ko PM kare (instant)
-    try:
-        sent = await _send_by_file_id(userbot, BOT_USERNAME, kind, file_id, cap, info)
-    except Exception as e:
-        print(f"Transfer send failed ({info['msg_id']}): {e}", flush=True)
-        return False
-    # Bot ke liye transfer chat = userbot wale account ki ID (private chat
-    # har taraf se dusri party ki ID se jaani jaati hai)
-    peer_uid = getattr(sent.from_user, "id", None) if sent.from_user else None
-    if not peer_uid:
-        try:
-            peer_uid = (await userbot.get_me()).id
-        except Exception:
-            return False
-    tmid = sent.id
-    try:
-        # 2) bot transfer message ko COPY karke asli destination de (instant)
-        copied = await client.copy_message(dest_chat, peer_uid, tmid)
-        # 3) topic me bhi — copy se mila BOT ka file_id use karke (instant)
-        bot_fid = _sent_file_id(copied, kind)
-        if group_id and topic_id and bot_fid:
-            await _botapi_send_to_topic(
-                kind, file_id=bot_fid, caption=cap,
-                topic_id=topic_id, info=info)
-        elif group_id and bot_fid:
-            try:
-                await _send_by_file_id(client, group_id, kind, bot_fid, cap, info)
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        print(f"Transfer copy failed ({info['msg_id']}): {e}", flush=True)
-        return False
-    finally:
-        # 4) transfer message hata do — user ke chat me wo dikhna nahi chahiye
-        try:
-            await client.delete_messages(peer_uid, [tmid])
-        except Exception:
-            pass
 
 
 async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None):
@@ -1228,6 +1376,23 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
     kind = info["kind"]
     s = get_settings(uid)
     group_id = LOG_GROUP_ID
+    # v43 caption helper: (1) original caption par remove/replace rules,
+    # (2) caption template REPLACE nahi — original ke NICHE append hoga,
+    # (3) phir bold. Slow path me rename ke baad naye naam se dobara
+    # banane ke liye bhi yahi use hota hai.
+    _orig_cap = info.get("caption") or ""
+
+    def _make_cap(fname):
+        c = apply_text_rules(_orig_cap, s)
+        if c != _orig_cap:
+            print(f"[CAPTION] rules lage msg {info.get('msg_id')}", flush=True)
+        if s["caption"]:
+            try:
+                tpl = s["caption"].format(filename=fname)
+            except Exception:
+                tpl = s["caption"]
+            c = f"{c}\n{tpl}" if c else tpl
+        return _bold_text(c) if c else ""
 
     def _clean():
         if info.get("tmpdir"):
@@ -1263,19 +1428,11 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             print(f"Group text send failed: {e}", flush=True)
 
     try:
-        # caption (settings template)
-        cap = info.get("caption") or ""
-        if s["caption"]:
-            try:
-                cap = s["caption"].format(filename=info.get("file_name", "file"))
-            except Exception:
-                cap = s["caption"]
-        # Extracted caption ko BOLD me convert karo (content same, sirf bold)
-        if cap:
-            cap = _bold_text(cap)
+        # caption: rules + append template (v43), bold ke saath
+        cap = _make_cap(info.get("file_name", "file"))
 
         if kind == "text":
-            bold_text = _bold_text(info["text"])
+            bold_text = _bold_text(apply_text_rules(info["text"], s))
             await client.send_message(
                 dest_chat, bold_text, parse_mode=enums.ParseMode.HTML)
             await _to_group_text(bold_text)
@@ -1289,24 +1446,17 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             )
             return False
 
-        # === FAST PATH: file_id se INSTANT bhejo ===
+        # === FAST PATH: file_id se INSTANT bhejo (sirf BOT ka apna file_id) ===
+        # v44: transfer/instant-share path HATA DIYA (user demand). Ab instant
+        # sirf tab jab bot khud fetch karta ho (public source) — userbot wale
+        # file_id par bot ke send karne ki koshish hi bekar thi (MEDIA_EMPTY),
+        # isliye private source par seedha download+upload chalta hai.
         file_id = info.get("file_id")
-        if file_id and not _needs_file(s, info):
-            # file_id kis session ne fetch kiya? Bot ka apna hai to direct
-            # bhejo; USERBOT ka hai to bot direct use nahi kar sakta — pehle
-            # transfer trick try karo, fir direct, fir download fallback.
-            if userbot is None or userbot is client:
-                ok = await _direct_fast(
-                    client, dest_chat, group_id, topic_id,
-                    kind, file_id, cap, info)
-            else:
-                ok = await _transfer_fast(
-                    client, userbot, dest_chat, group_id, topic_id,
-                    kind, file_id, cap, info)
-                if not ok:
-                    ok = await _direct_fast(
-                        client, dest_chat, group_id, topic_id,
-                        kind, file_id, cap, info)
+        if (file_id and not _needs_file(s, info)
+                and (userbot is None or userbot is client)):
+            ok = await _direct_fast(
+                client, dest_chat, group_id, topic_id,
+                kind, file_id, cap, info)
             if ok:
                 info["delivered_fast"] = True
                 return True
@@ -1314,12 +1464,22 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                   flush=True)
 
         # === SLOW PATH: download + settings + upload ===
-        fp = await download_file(userbot, info, prog_msg, stats, uid, client)
+        # v44 PIPELINE: run_batch agli file pehle se background me download
+        # kar chuka hota hai — info["file_path"] mila to wahi use karo.
+        fp = info.get("file_path")
+        if fp and os.path.exists(fp):
+            print(f"📦 Prefetch se file mil gayi msg {info['msg_id']} "
+                  "(download pehle se ho chuki)", flush=True)
+        else:
+            print(f"⬇️ DOWNLOAD chal raha hai msg {info['msg_id']}", flush=True)
+            fp = await download_file(userbot, info, prog_msg, stats, uid, client)
         if not fp:
             _clean()
             return False
 
         # settings: filename (remove/replace/tag)
+        # v43: rename ke baad info["file_name"] bhi update — warna aage
+        # purana naam use hota tha aur rename ka asar gayab lagta tha.
         base = os.path.basename(fp)
         new_base = apply_filename_rules(base, s)
         if new_base != base:
@@ -1328,13 +1488,12 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 os.rename(fp, new_fp)
                 fp = new_fp
                 info["file_path"] = fp
+                info["file_name"] = new_base
+                print(f"[NAME] {base} -> {new_base}", flush=True)
             except Exception:
                 pass
-        if s["caption"]:
-            try:
-                cap = s["caption"].format(filename=new_base)
-            except Exception:
-                cap = s["caption"]
+        # caption dobara banao: naye filename ke saath (append template)
+        cap = _make_cap(new_base)
 
         # settings: custom thumbnail
         th = info.get("thumb_path")
@@ -1492,10 +1651,20 @@ async def _pin_status(client, chat_id, msg_id):
     return False
 
 
-# --- BATCH RUNNER: SEQUENTIAL (ek download -> upload -> next) ---
-# Har file: pehle download karo, turant upload karo, complete.
-# Phir agli file. Koi parallel nahi - har file ko poori bandwidth milti hai
-# aur files ek-ek karke order me milti hain. Disk par 1 se zyada file nahi.
+# --- BATCH RUNNER: SEQUENTIAL DELIVERY + PIPELINED DOWNLOAD (v44) ---
+# Delivery ORDER hamesha ek jaisa rehta hai (file 1, 2, 3...). Lekin v44 me
+# jab file N bot se UPLOAD ho rahi hoti hai, tab file N+1 userbot se
+# background me DOWNLOAD ho rahi hoti hai — dono alag network connection
+# hain, isliye ek hi time me dono kaam hote hain aur batch lagbhag 2x tez.
+# Disk par max 2 files (current + next) — Koyeb free plan ke liye safe.
+def _cleanup_prepared(holder):
+    """Prefetch me download hui file ka temp folder saaf karo (jab wo
+    deliver nahi hui — cancel/skip case)."""
+    info = (holder or {}).get("info")
+    if isinstance(info, dict) and info.get("tmpdir"):
+        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+
+
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
     # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
@@ -1534,6 +1703,33 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         "Phir dobara try karo."
     )
 
+    # v44 PIPELINE: is file ka metadata + (zaroorat ho to) download. Jab ye
+    # background task agli file ke liye chal raha hota hai, tab current file
+    # bot se upload ho rahi hoti hai — dono connections alag, time bachta hai.
+    async def _prepare(mid, pre, holder):
+        try:
+            info = await fetch_one(fetch_client, src_chat, mid, preloaded=pre)
+            holder["info"] = info
+            if (isinstance(info, dict)
+                    and info.get("kind") not in ("text", "too_big")
+                    and info.get("target_msg")):
+                s = get_settings(owner_id)
+                needs_dl = (
+                    fetch_client is not client   # private source: instant fail hoga hi
+                    or not info.get("file_id")
+                    or _needs_file(s, info)      # settings lagani hain
+                )
+                if needs_dl:
+                    try:
+                        await download_file(
+                            fetch_client, info, None, stats, owner_id, client)
+                    except Exception as e:
+                        print(f"Prefetch download fail ({mid}): {e}", flush=True)
+            return info
+        except Exception as e:
+            print(f"Prefetch fail ({mid}): {e}", flush=True)
+            return None
+
     # Status message ko PIN karo taaki upar dikhe (2 tareeke try honge)
     pinned = await _pin_status(client, owner_id, status_msg.id)
     try:
@@ -1543,6 +1739,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             # Pehli koshish fail hui ho to ek baar aur try karo
             pinned = await _pin_status(client, owner_id, status_msg.id)
         prog_msg = None
+        holders = set()      # prefetch holders (cleanup ke liye)
+        pending_task = None  # background prepare task (agli file ka)
+        pending_mid = None
+        pending_holder = None
         # v40 SPEED: metadata CHUNK me fetch hota hai — 1 call me FETCH_CHUNK
         # (default 100) messages, pehle har message par alag call thi.
         i = 0
@@ -1556,17 +1756,34 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 )
                 cancel_event.set()
                 break
-            for mid in chunk:
+            for ci, mid in enumerate(chunk):
                 if cancel_event.is_set():
                     break
-                # STEP 1: message ka metadata + file_id lao (download NAHI)
+                # STEP 1: metadata lao (pipeline se ya fresh)
                 if fetched is None:
                     pre = None          # chunk fail — purana per-id fetch chlega
                 elif mid in fetched:
                     pre = fetched[mid]  # chunk se mil gaya (network call skip)
                 else:
                     pre = "MISSING"     # chunk OK tha, ye id delete/invalid hai
-                info = await fetch_one(fetch_client, src_chat, mid, preloaded=pre)
+                if pending_task is not None and pending_mid == mid:
+                    # v44: ye file background me pehle se prepare ho rahi thi
+                    info = await pending_task
+                    pending_task = None
+                    if pending_holder is not None:
+                        holders.discard(pending_holder)
+                        pending_holder = None
+                else:
+                    if pending_task is not None:
+                        pending_task.cancel()  # stale task (koi id skip hua)
+                        pending_task = None
+                        if pending_holder is not None:
+                            _cleanup_prepared(pending_holder)
+                            holders.discard(pending_holder)
+                            pending_holder = None
+                    holder = {}
+                    holders.add(holder)
+                    info = await _prepare(mid, pre, holder)
                 if cancel_event.is_set():
                     break
                 if info == "PEER_INVALID":
@@ -1599,11 +1816,30 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                         parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception:
                     prog_msg = None
+                # v44 PIPELINE: is file ke UPLOAD ke dauraan agli file ka
+                # download background me shuru kar do (order same rahega)
+                if (pending_task is None and ci + 1 < len(chunk)
+                        and mid != ids[-1] and not cancel_event.is_set()):
+                    nxt = chunk[ci + 1]
+                    if fetched is None:
+                        pre_n = None
+                    elif nxt in fetched:
+                        pre_n = fetched[nxt]
+                    else:
+                        pre_n = "MISSING"
+                    h = {}
+                    holders.add(h)
+                    pending_task = asyncio.create_task(_prepare(nxt, pre_n, h))
+                    pending_mid = nxt
+                    pending_holder = h
                 # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
                 # prog_msg = per-file progress (alag message), status_msg = pinned batch
                 ok_one = await upload_one(
                     client, fetch_client, owner_id, dest_chat, topic_id,
                     status_msg, info, stats, prog_msg)
+                # Memory: inline-prepared file ka holder ab zaroorat nahi
+                if 'holder' in locals() and holder in holders:
+                    holders.discard(holder)
                 async with stats.lock:
                     stats.done += 1
                     if ok_one:
@@ -1612,11 +1848,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                         stats.fail += 1
                 # Pinned status live update (max 3 sec me 1 baar)
                 await _update_batch_status(status_msg, stats)
-                # FLOOD PACING (v40): instant delivery (file_id/copy/transfer)
-                # ke baad chhota gap (FAST_GAP, default 2s), slow delivery
-                # (download+upload) ke baad bada gap (SLOW_GAP, default 3s).
-                # Ek hi bot account se lagatar media bhejne par Telegram
-                # SendMedia FloodWait laga deta tha — isliye gap zaroori hai.
+                # FLOOD PACING: instant delivery (public file_id) ke baad chhota
+                # gap (FAST_GAP), slow delivery (download+upload) ke baad bada
+                # gap (SLOW_GAP). Is gap me background download chalta rehta
+                # hai, isliye ye wait bhi waste nahi hota.
                 if mid != ids[-1]:
                     gap = FAST_GAP if (
                         isinstance(info, dict) and info.get("delivered_fast")
@@ -1625,6 +1860,14 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             i += len(chunk)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
+        # Background prefetch task roko + uske temp files saaf karo
+        if locals().get("pending_task") is not None:
+            try:
+                pending_task.cancel()
+            except Exception:
+                pass
+        for h in locals().get("holders", []) or []:
+            _cleanup_prepared(h)
         # Aakhri progress message saaf karo (pinned status rehne do)
         if 'prog_msg' in locals() and prog_msg:
             try:
@@ -2415,15 +2658,27 @@ def settings_keyboard(uid):
     return InlineKeyboardMarkup(kb)
 
 
-def apply_filename_rules(filename, s):
-    """remove_words -> replace_words -> rename_tag lagao."""
-    name, ext = os.path.splitext(filename)
+def apply_text_rules(text, s):
+    """Caption/text par remove_words -> replace_words lagao (case-insensitive).
+    v43: pehle ye rules sirf filename par lagte the, isliye caption dekh
+    kar lagta tha 'kaam nahi kar raha' — ab caption/text par bhi lagenge."""
+    out = text or ""
     for w in s.get("remove_words", []):
         if w:
-            name = name.replace(w, "")
+            out = re.sub(re.escape(w), "", out, flags=re.IGNORECASE)
     for pair in s.get("replace_words", []):
         if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]:
-            name = name.replace(pair[0], pair[1])
+            out = re.sub(re.escape(pair[0]), lambda m: pair[1], out,
+                         flags=re.IGNORECASE)
+    out = re.sub(r" {2,}", " ", out).strip()
+    return out
+
+
+def apply_filename_rules(filename, s):
+    """remove_words -> replace_words -> rename_tag lagao (filename par).
+    v43: matching case-insensitive — 'JOIN' bhi 'join' rule se hatega."""
+    name, ext = os.path.splitext(filename)
+    name = apply_text_rules(name, s)
     name = re.sub(r"\.{2,}", ".", name)
     name = re.sub(r"\s{2,}", " ", name).strip(" .")
     tag = s.get("rename_tag")
@@ -2539,19 +2794,19 @@ async def settings_callbacks(client, query):
     elif data == "st_caption":
         SETTING_STATES[uid] = {"action": "set_caption"}
         await query.message.reply_text(
-            "💬 **Caption**\n\nCaption template bhejo. `{filename}` likhne par file ka naam aayega.\n"
+            "💬 **Caption**\n\nYe text original caption ke NICHE add hoga (purana caption hataya nahi jayega). `{filename}` likhne par file ka naam aayega.\n"
             "Jaise: `🔥 {filename}`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_replace":
         SETTING_STATES[uid] = {"action": "set_replace"}
         await query.message.reply_text(
-            "🔄 **Replace Words**\n\nHar line par `purana | naya` bhejo.\n"
+            "🔄 **Replace Words**\n\nHar line par `purana | naya` bhejo. Ye caption, text aur filename — teeno par lagega.\n"
             "Jaise:\n`x265 | x264`\n`1080p | 720p`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_remove":
         SETTING_STATES[uid] = {"action": "set_remove"}
         await query.message.reply_text(
-            "🧹 **Remove Words**\n\nComma se alag karke words bhejo, jo filename se hatane hain.\n"
+            "🧹 **Remove Words**\n\nComma se alag karke words bhejo, jo caption, text aur filename se hatane hain.\n"
             "Jaise: `x265, PSA, 1080p`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_reset":
@@ -2842,11 +3097,6 @@ async def main():
     await app.start()
 
     me = await app.get_me()
-    # Transfer fast path ke liye bot ka username cache karo — userbot private
-    # source wali files is username par PM karta hai (koi bhi account bot ko
-    # PM kar sakta hai, isliye group membership ki zaroorat nahi padti).
-    global BOT_USERNAME
-    BOT_USERNAME = me.username
     try:
         await app.set_bot_commands([
             BotCommand("start", "Bot start karo"),
@@ -2865,15 +3115,11 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
-    print("👉 MODE: sequential (ek download → upload → next)", flush=True)
+    print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
-    if BOT_USERNAME:
-        print(f"👉 TRANSFER FAST PATH: ON (@{BOT_USERNAME}) — private files bhi "
-              "bina download instant delivery", flush=True)
-    else:
-        print("👉 TRANSFER FAST PATH: OFF (bot username nahi mila)", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s "
           f"FETCH_CHUNK={FETCH_CHUNK}", flush=True)
+    print(f"👉 MULTI_DL: {MULTI_PARTS} parts/file (ek file ke parts parallel, order sequential)", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
