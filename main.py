@@ -86,7 +86,7 @@ BATCH_LIMIT = max(1, int(os.environ.get("BATCH_LIMIT", "1000")))
 FAST_GAP = float(os.environ.get("FAST_GAP", "2"))
 SLOW_GAP = float(os.environ.get("SLOW_GAP", "3"))
 # v40 SPEED: metadata ek hi get_messages call me itne messages ka aata hai
-# (pehle har message ke liye alag call thi â€” 100 files par 100 requests).
+# (pehle har message ke liye alag call thi — 100 files par 100 requests).
 # Max 200 (Telegram limit).
 FETCH_CHUNK = max(1, min(200, int(os.environ.get("FETCH_CHUNK", "100"))))
 
@@ -96,9 +96,9 @@ FETCH_CHUNK = max(1, min(200, int(os.environ.get("FETCH_CHUNK", "100"))))
 # uska ID Koyeb env me BACKUP_CHAT_ID me daalo. Har JSON save ke baad bot
 # uski copy channel me bhej dega; redeploy ke baad jo file local nahi
 # milegi, wo channel se wapas aa jayegi. DATA_DIR/volume wala tareeka bhi
-# saath me chalta rahega â€” dono me se jo mile, wahi use hoga.
+# saath me chalta rahega — dono me se jo mile, wahi use hoga.
 # NOTE: sessions.json me users ke login session strings hote hain, isliye
-# backup channel HAMESHA private rakho â€” sirf tum (owner) usme raho.
+# backup channel HAMESHA private rakho — sirf tum (owner) usme raho.
 try:
     _raw_backup = os.environ.get("BACKUP_CHAT_ID", "").strip()
     BACKUP_CHAT_ID = int(_raw_backup) if _raw_backup else None
@@ -136,7 +136,7 @@ async def _backup_upload(fname, path):
 async def _backup_restore_all():
     """Startup par: jo JSON store local nahi hai, use backup channel se lao.
     Bot MTProto se channel history NAHI padh sakta (messages.GetHistory par
-    BOT_METHOD_INVALID aata hai â€” v36 ke live logs me confirm hua), isliye
+    BOT_METHOD_INVALID aata hai — v36 ke live logs me confirm hua), isliye
     history scan OWNER ke userbot se hota hai. Upload bot se hi hota hai
     (channel me post karna bot ke liye allowed hai)."""
     if not BACKUP_CHAT_ID:
@@ -144,9 +144,9 @@ async def _backup_restore_all():
     global _OWNER_UB_STARTED
     if user is None:
         print("backup restore SKIP: SESSION_STRING wala owner userbot nahi "
-              "mila â€” bot akele history nahi padh sakta.", flush=True)
+              "mila — bot akele history nahi padh sakta.", flush=True)
         return
-    # Deploy overlap me purana instance kuch der zinda rehta hai â€” usi
+    # Deploy overlap me purana instance kuch der zinda rehta hai — usi
     # beech userbot start karo to 406 AUTH_KEY_DUPLICATED aata hai.
     # Isliye 406 par ruko aur dobara try karo (purana instance marne do).
     for _att in range(4):
@@ -162,7 +162,7 @@ async def _backup_restore_all():
                 break
             if "AUTH_KEY_DUPLICATED" in es and _att < 3:
                 print(f"backup restore: 406 duplicate (attempt {_att + 1}/4)"
-                      " â€” 20s ruk ke dobara try...", flush=True)
+                      " — 20s ruk ke dobara try...", flush=True)
                 await asyncio.sleep(20)
                 continue
             print(f"backup restore: userbot start fail: {e}", flush=True)
@@ -197,7 +197,7 @@ async def _backup_restore_all():
 # (bot + owner userbot + per-user userbots sab milkar 100+ threads ban jate
 # the). 16 updates handle karne ke liye kaafi hai.
 # sleep_threshold=60: 60 sec tak ke FloodWait Pyrogram khud absorb karega
-# (default 10 tha â€” bade wait par exception aata tha aur file fail ho jati thi).
+# (default 10 tha — bade wait par exception aata tha aur file fail ho jati thi).
 app = Client(
     "bot_service",
     api_id=API_ID,
@@ -306,7 +306,7 @@ async def _logout_user(uid):
             await c.disconnect()
         except Exception:
             pass
-    # v44: is user ke cached media sessions bhi mar jayenge â€” saaf kar do
+    # v44: is user ke cached media sessions bhi mar jayenge — saaf kar do
     # (warna stale sessions cache me padi rahengi)
     try:
         _evict_media_sessions(c)
@@ -342,7 +342,7 @@ async def get_userbot(uid):
         USER_CLIENTS[uid] = c
         return c
     # Owner fallback: sirf ASLI owner ke liye. Pehle OWNER_ID set na hone
-    # par (open mode) HAR user owner ka global userbot use kar leta tha â€”
+    # par (open mode) HAR user owner ka global userbot use kar leta tha —
     # strangers apni batch owner ke account se chalate the, jisse us
     # account par download flood/restriction ka poora risk aa jata tha.
     if user is not None and OWNER_ID != 0 and uid == OWNER_ID:
@@ -359,7 +359,7 @@ async def get_userbot(uid):
 
 # --- KOYEB HEALTH CHECK WEB SERVER ---
 async def health_check(request):
-    return web.Response(text="âš¡ VILLAN Restricted Bot is Active!")
+    return web.Response(text="⚡ VILLAN Restricted Bot is Active!")
 
 
 async def start_web_server():
@@ -369,7 +369,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"ðŸŒ Health server running on port {PORT}", flush=True)
+    print(f"🌐 Health server running on port {PORT}", flush=True)
 
 
 # --- FORMATTING UTILITIES ---
@@ -387,7 +387,7 @@ def humanbytes(size):
 
 def _bold_text(text):
     """Extracted caption/text ko BOLD me convert karo (HTML mode).
-    HTML me sirf <, >, & escape karne padte hain â€” koi visible
+    HTML me sirf <, >, & escape karne padte hain — koi visible
     backslash nahi dikhega. Content same rahega, sirf bold dikhega."""
     if not text:
         return text
@@ -418,7 +418,7 @@ def time_formatter(milliseconds: int) -> str:
 def get_progress_bar(percentage):
     completed = int(percentage // 10)
     remaining = 10 - completed
-    return "â–°" * completed + "â–±" * remaining
+    return "▰" * completed + "▱" * remaining
 
 
 async def safe_edit(msg, text):
@@ -454,55 +454,55 @@ async def _update_batch_status(status_msg, stats, force=False):
         elapsed = max(now - stats.start, 1)
     pct = (done * 100 / total) if total > 0 else 0
     filled = int(pct // 10)
-    bar = ("ðŸŸ©" * filled + "â¬œ" * (10 - filled))
+    bar = ("🟩" * filled + "⬜" * (10 - filled))
     # ETA
     remaining = total - done
     per_file = elapsed / max(done, 1)
     eta_s = int(remaining * per_file)
-    eta_str = time_formatter(eta_s * 1000) if done > 0 else "â€”"
+    eta_str = time_formatter(eta_s * 1000) if done > 0 else "—"
     text = (
-        "ðŸ“¦ **BATCH STATUS**\n"
+        "📦 **BATCH STATUS**\n"
         f"{bar} `{pct:.0f}%`\n"
-        "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-        f"ðŸ“ Total: `{total}`\n"
-        f"âœ… Done: `{ok}`  âŒ Failed: `{fail}`\n"
-        f"â±ï¸ ETA: `{eta_str}`\n"
-        "â¹ Cancel: `/cancel`"
+        "━━━━━━━━━━━━━━━\n"
+        f"📁 Total: `{total}`\n"
+        f"✅ Done: `{ok}`  ❌ Failed: `{fail}`\n"
+        f"⏱️ ETA: `{eta_str}`\n"
+        "⏹ Cancel: `/cancel`"
     )
     await safe_edit(status_msg, text)
 
 
 # --- LIVE PROGRESS TRACKER (file + batch dashboard) ---
 async def _premium_card(uid, bot_client=None):
-    """âšœï¸ á´˜Ê€á´‡á´Éªá´œá´ á´œêœ±á´‡Ê€ á´…á´€á´›á´€ card â€” plan/premium check ke liye."""
+    """⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ card — plan/premium check ke liye."""
     try:
         _u = await bot_client.get_users(uid) if bot_client else None
         _name = (_u.first_name if _u and _u.first_name else "User")
     except Exception:
         _name = "User"
     if _is_owner(uid):
-        _tl, _ed, _et = "Lifetime ðŸ‘‘", "â€”", "â€”"
+        _tl, _ed, _et = "Lifetime 👑", "—", "—"
     elif uid in _get_allowed():
-        _tl, _ed, _et = "Lifetime âœ…", "â€”", "â€”"
+        _tl, _ed, _et = "Lifetime ✅", "—", "—"
     else:
         _rem = _sub_remaining(uid)
         if _rem > 0:
             _d, _h = int(_rem // 86400), int((_rem % 86400) // 3600)
             _m = int((_rem % 3600) // 60)
-            _tl = f"{_d} á´…á´€Êêœ±, {_h} Êœá´á´œÊ€êœ±, {_m} á´ÉªÉ´á´œá´›á´‡êœ±"
+            _tl = f"{_d} ᴅᴀʏꜱ, {_h} ʜᴏᴜʀꜱ, {_m} ᴍɪɴᴜᴛᴇꜱ"
             _exp = time.time() + _rem
             _ed = time.strftime("%d-%m-%Y", time.localtime(_exp))
             _et = time.strftime("%I:%M:%S %p", time.localtime(_exp))
         else:
-            _tl, _ed, _et = "Expired âŒ", "â€”", "â€”"
+            _tl, _ed, _et = "Expired ❌", "—", "—"
     return "\n".join([
-        "âšœï¸ á´˜Ê€á´‡á´Éªá´œá´ á´œêœ±á´‡Ê€ á´…á´€á´›á´€ :",
+        "⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ :",
         "",
-        f"ðŸ‘¤ á´œêœ±á´‡Ê€ : {_name}",
-        f"âš¡ á´œêœ±á´‡Ê€ Éªá´… : {uid}",
-        f"â° á´›Éªá´á´‡ ÊŸá´‡êœ°á´› : {_tl}",
-        f"âŒ›ï¸ á´‡xá´˜ÉªÊ€Ê á´…á´€á´›á´‡ : {_ed}",
-        f"â±ï¸ á´‡xá´˜ÉªÊ€Ê á´›Éªá´á´‡ : {_et}",
+        f"👤 ᴜꜱᴇʀ : {_name}",
+        f"⚡ ᴜꜱᴇʀ ɪᴅ : {uid}",
+        f"⏰ ᴛɪᴍᴇ ʟᴇꜰᴛ : {_tl}",
+        f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {_ed}",
+        f"⏱️ ᴇxᴘɪʀʏ ᴛɪᴍᴇ : {_et}",
     ])
 
 
@@ -520,33 +520,33 @@ async def progress_bar(
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
 
-    # ðŸŸ¥ Squares wala progress bar (10 blocks)
+    # 🟥 Squares wala progress bar (10 blocks)
     filled = int(percentage // 10)
-    sq_bar = ("ðŸŸ¥ " * filled + "â¬œ " * (10 - filled)).strip()
+    sq_bar = ("🟥 " * filled + "⬜ " * (10 - filled)).strip()
 
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
     # Message ID nikalo (action_title me "ID `123`" format me hai)
     _mid = re.search(r"ID `(\d+)`", action_title or "")
-    mid_str = _mid.group(1) if _mid else "â€”"
+    mid_str = _mid.group(1) if _mid else "—"
 
     # UPLOADING ya DOWNLOADING
     op = "UPLOADING" if "Upload" in (action_title or "") else "DOWNLOADING"
 
-    # â”â”â” SHORT PROGRESS BAR (sirf download/upload ke liye) â”â”â”
-    # Batch line aur premium card YAHAN nahi â€” wo alag pinned status me hai
+    # ━━━ SHORT PROGRESS BAR (sirf download/upload ke liye) ━━━
+    # Batch line aur premium card YAHAN nahi — wo alag pinned status me hai
     lines = [
         op,
         "",
         sq_bar,
-        "â•­â”â”â”â”â°á´˜Ê€á´É¢Ê€á´‡ss Ê™á´€Ê€â±â”âž£",
-        f"â”£âª¼ ðŸ—‚ï¸ : {humanbytes(current)} | {humanbytes(total)}",
-        f"â”£âª¼ â³ï¸ : {percentage:.1f}%",
-        f"â”£âª¼ ðŸš€ : {humanbytes(speed)}/s",
-        f"â”£âª¼ â±ï¸ : {time_formatter(time_left * 1000)}",
-        f"â”£âª¼Message ID: {mid_str}",
-        "â•°â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”âž£",
+        "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣",
+        f"┣⪼ 🗂️ : {humanbytes(current)} | {humanbytes(total)}",
+        f"┣⪼ ⏳️ : {percentage:.1f}%",
+        f"┣⪼ 🚀 : {humanbytes(speed)}/s",
+        f"┣⪼ ⏱️ : {time_formatter(time_left * 1000)}",
+        f"┣⪼Message ID: {mid_str}",
+        "╰━━━━━━━━━━━━━━━➣",
     ]
     await safe_edit(message, "\n".join(lines))
 
@@ -584,7 +584,7 @@ async def _fetch_chunk(user_client, src_chat, id_chunk):
     """v40 SPEED: ek hi get_messages call me poore chunk ka metadata lao.
     Pehle har message ke liye alag request thi (100 files = 100 requests,
     har ek par FloodWait ka risk + ~100-300ms latency). Ab 100 files = 1
-    request. Returns: {msg_id: Message} | None (chunk fail â€” per-id
+    request. Returns: {msg_id: Message} | None (chunk fail — per-id
     fallback chalega) | 'BREAK' (channel access hi nahi hai)."""
     if not user_client:
         return None
@@ -613,7 +613,7 @@ async def _fetch_chunk(user_client, src_chat, id_chunk):
         except (PeerIdInvalid, ValueError) as e:
             if isinstance(e, ValueError) and "Peer id invalid" not in str(e):
                 return None
-            # Peer cache cold hai â€” dialogs sync karke warm karo, retry
+            # Peer cache cold hai — dialogs sync karke warm karo, retry
             try:
                 await user_client.get_dialogs(limit=500)
             except Exception as de:
@@ -639,7 +639,7 @@ async def fetch_one(user_client, src_chat, msg_id, preloaded=None):
     if preloaded is not None:
         target_msg = preloaded
     else:
-        # Retry transient failures (max 3 attempts) â€” sirf tab jab chunk se
+        # Retry transient failures (max 3 attempts) — sirf tab jab chunk se
         # message nahi mila tha
         last_err = None
         for attempt in range(3):
@@ -700,7 +700,7 @@ def _info_from_msg(target_msg, msg_id):
         # Photo/voice/sticker jaisi media me file_name hota hi nahi.
         # Bina extension ke download hui photo ko upload karne par
         # Telegram PHOTO_EXT_INVALID deta hai (v35 ke live logs me
-        # yahi photo-fail ki asli wajah nikli) â€” sahi extension lagao.
+        # yahi photo-fail ki asli wajah nikli) — sahi extension lagao.
         _ext = {"photo": ".jpg", "voice": ".ogg", "video_note": ".mp4",
                 "sticker": ".webp", "animation": ".mp4"}.get(kind, "")
         fname = f"media_{msg_id}{_ext}"
@@ -753,7 +753,7 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
             progress=progress_bar,
             progress_args=(
                 prog_msg, start_time, last_update,
-                f"ðŸ“¥ Downloading â€¢ ID `{msg_id}`", stats, uid, bot_client,
+                f"📥 Downloading • ID `{msg_id}`", stats, uid, bot_client,
             ),
         )
         if not file_path or not os.path.exists(file_path):
@@ -784,7 +784,7 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
 
 # --- v41 MULTI-CONNECTION DOWNLOAD (v40 se tagra change) ---
 # Rule intact: file EK BAAR ME EK HI download hoti hai (sequential batch
-# order same hai) â€” lekin us EK file ke 1MB parts ek saath (MULTI_PARTS
+# order same hai) — lekin us EK file ke 1MB parts ek saath (MULTI_PARTS
 # concurrent GetFile requests, ek hi media session par) aate hain.
 # Single-connection download latency-bound hota hai (har 1MB part ke liye
 # round-trip wait), isliye concurrent parts se throughput kai guna badh
@@ -796,7 +796,7 @@ MULTI_CHUNK = 1024 * 1024  # 1MB parts (Pyrogram ke get_file jaisa)
 
 # v44 SPEED: media DC session CACHE. Pehle HAR file par naya media session
 # + auth key exchange hota tha (~1-3 sec/file sirf setup me). Ab ek hi
-# session ban kar reuse hoti hai â€” 100 files ke batch me 2-5 minute bachte
+# session ban kar reuse hoti hai — 100 files ke batch me 2-5 minute bachte
 # hain sirf setup me. Session kharab ho jaye to evict karke agli file me
 # naya ban jata hai (fallback classic waise hi hai).
 _MEDIA_SESSION_CACHE = {}  # (id(client), dc_id) -> Session
@@ -823,7 +823,7 @@ def _evict_media_sessions(user_client, dc_id=None):
 
 
 async def _get_media_session(user_client, dc_id):
-    """Is client+DC ka (cached) media session lao â€” pehli baar banega."""
+    """Is client+DC ka (cached) media session lao — pehli baar banega."""
     from pyrogram import raw as _raw
     from pyrogram.session import Auth, Session
     key = (id(user_client), dc_id)
@@ -882,7 +882,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
         downloaded = [0]
         start_time = time.time()
         last_update = [time.time()]
-        label = f"ðŸ“¥ Downloading â€¢ ID `{msg_id}`"
+        label = f"📥 Downloading • ID `{msg_id}`"
         f = open(dl_path, "wb")
         try:
             for wave_start in range(0, n_parts, MULTI_PARTS):
@@ -931,7 +931,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
                 f"!= {file_size}")
         return dl_path
     except BaseException as e:
-        # FloodWait transient hai â€” session cache me hi rehne do. Baaki
+        # FloodWait transient hai — session cache me hi rehne do. Baaki
         # failure par session stale ho sakta hai, evict kar do.
         if not isinstance(e, FloodWait):
             _evict_media_sessions(user_client, dc_id)
@@ -944,7 +944,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
 
 async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
     """v41 wrapper: pehle multi-connection download try karo, fail par classic.
-    File order abhi bhi sequential hai â€” sirf ek file ke parts parallel aate hain."""
+    File order abhi bhi sequential hai — sirf ek file ke parts parallel aate hain."""
     msg_id = info.get("msg_id")
     if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
             and info.get("file_id")
@@ -995,9 +995,9 @@ def _needs_file(s, info):
 
 
 async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=None):
-    """file_id se bhejo â€” INSTANT, server-side (no download/upload)."""
+    """file_id se bhejo — INSTANT, server-side (no download/upload)."""
     kw = {"reply_to_message_id": topic_id} if topic_id else {}
-    # Caption _bold_text() se HTML (<b>...</b>) me aata hai â€” bina parse_mode
+    # Caption _bold_text() se HTML (<b>...</b>) me aata hai — bina parse_mode
     # ke Telegram tags ko literal text dikhayega, isliye HTML mode zaroori hai.
     cap_kw = {"parse_mode": enums.ParseMode.HTML} if caption else {}
     if kind == "video":
@@ -1028,7 +1028,7 @@ async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=
 
 def _sent_file_id(sent_msg, kind):
     """Bot ne jo message bheja, uske media ka file_id nikalo.
-    Ye file_id BOT ka apna hai â€” isko dobara use kar sakte hain
+    Ye file_id BOT ka apna hai — isko dobara use kar sakte hain
     (userbot wala file_id bot use NAHI kar sakta -> MEDIA_EMPTY)."""
     if not sent_msg:
         return None
@@ -1041,11 +1041,11 @@ def _sent_file_id(sent_msg, kind):
 # --- GROUP TOPIC (har user ke naam ka folder) ---
 # --- GROUP TOPIC: Bot API se bhejo (message_thread_id) ---
 # MTProto raw API me top_msg_id kaam nahi kar raha, isliye Bot API ka
-# message_thread_id use karenge â€” ye forum topics ke liye GUARANTEED kaam karta hai.
+# message_thread_id use karenge — ye forum topics ke liye GUARANTEED kaam karta hai.
 import aiohttp as _aiohttp
 
 # v40 SPEED: ek hi aiohttp session REUSE karo. Pehle har Bot API call par
-# naya ClientSession (naya TLS handshake) banta tha â€” 1000 files ke batch me
+# naya ClientSession (naya TLS handshake) banta tha — 1000 files ke batch me
 # har file par ~200-500ms sirf handshake me waste hote the.
 _HTTP_SESSION = None
 
@@ -1076,7 +1076,7 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
             "message_thread_id": str(topic_id),
             "caption": caption or "",
         }
-        # Caption _bold_text() se HTML (<b>) me hai â€” bina parse_mode ke
+        # Caption _bold_text() se HTML (<b>) me hai — bina parse_mode ke
         # Bot API tags ko literal dikhayega, isliye HTML mode do.
         if caption:
             data["parse_mode"] = "HTML"
@@ -1113,7 +1113,7 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
             param = {"video": "video", "audio": "audio", "photo": "photo",
                      "voice": "voice", "video_note": "video_note"}.get(kind, "document")
             # v40 FIX: pehle file object add_field ke baad close() ho rahi
-            # thi â€” aiohttp post ke waqt band file padhne ki koshish karta
+            # thi — aiohttp post ke waqt band file padhne ki koshish karta
             # tha. Ab pehle bytes padh lo, phir form me daalo.
             with open(file_path, "rb") as f:
                 files = {param: f.read()}
@@ -1203,7 +1203,7 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                     pass
         else:
             return False
-        # Caption _bold_text() se HTML (<b>) me hai â€” raw API ko tags
+        # Caption _bold_text() se HTML (<b>) me hai — raw API ko tags
         # hatake bold entity deni padti hai, warna tags literal dikhenge.
         cap_text = caption or ""
         cap_entities = None
@@ -1211,7 +1211,8 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                 and len(cap_text) > 7):
             import html as _html
             cap_text = _html.unescape(cap_text[3:-4])
-            # v46 FIX: entity length UTF-16 code units me (emoji-safe)
+            # v46 FIX: Telegram entity length UTF-16 code units me ginta hai,
+            # Python len() emoji text me kam ginata tha -> ENTITY_BOUNDS_INVALID
             _cu16 = len(cap_text.encode("utf-16-le")) // 2
             cap_entities = [raw.types.MessageEntityBold(
                 offset=0, length=_cu16)]
@@ -1286,10 +1287,10 @@ async def get_or_create_topic(userbot, uid):
     if stored:
         print(f"[TOPIC] Stored topic_id mil gaya: {stored}", flush=True)
         return stored
-    # STEP 2: Stored nahi hai (redeploy par wipe ho gaya?) â€”
+    # STEP 2: Stored nahi hai (redeploy par wipe ho gaya?) —
     # to group me EXISTING topic search karo (uid se), naya mat banao!
-    # Title format: "{Name} â€¢ {uid}" â€” uid se search karo.
-    # PEHLE owner ke apne userbot (global `user`) se search karo â€” wahi
+    # Title format: "{Name} • {uid}" — uid se search karo.
+    # PEHLE owner ke apne userbot (global `user`) se search karo — wahi
     # account log group ka member/admin hai. Per-user userbot group me
     # hota hi nahi, isliye usse search hamesha fail hota tha aur har
     # redeploy ke baad NAYA folder ban jata tha (duplicate folders bug)!
@@ -1303,7 +1304,7 @@ async def get_or_create_topic(userbot, uid):
             peer = await sc.resolve_peer(LOG_GROUP_ID)
             found_id = await _find_topic_id(sc, peer, str(uid))
             if found_id:
-                print(f"[TOPIC] âœ… EXISTING topic mil gaya: {found_id} for uid={uid}", flush=True)
+                print(f"[TOPIC] ✅ EXISTING topic mil gaya: {found_id} for uid={uid}", flush=True)
                 topics[str(uid)] = found_id
                 _save_json(TOPICS_FILE, topics)
                 return found_id
@@ -1313,11 +1314,11 @@ async def get_or_create_topic(userbot, uid):
         print(f"[TOPIC] Existing topic nahi mila, naya banayenge", flush=True)
     # STEP 3: Naya topic Bot API se banao (bot MTProto se nahi bana sakta!)
     # Title ke liye user ka naam lao (bot client se, userbot se nahi)
-    title = f"User â€¢ {uid}"
+    title = f"User • {uid}"
     try:
         # Bot client global 'app' se user info lao
         u = await app.get_users(uid)
-        title = f"{(u.first_name or 'User')[:25]} â€¢ {uid}"
+        title = f"{(u.first_name or 'User')[:25]} • {uid}"
     except Exception:
         pass
     print(f"[TOPIC] Naya topic bana raha hun: '{title}'", flush=True)
@@ -1325,15 +1326,15 @@ async def get_or_create_topic(userbot, uid):
     if topic_id:
         topics[str(uid)] = topic_id
         _save_json(TOPICS_FILE, topics)
-        print(f"[TOPIC] âœ… SUCCESS: topic={topic_id} for uid={uid}", flush=True)
+        print(f"[TOPIC] ✅ SUCCESS: topic={topic_id} for uid={uid}", flush=True)
         return topic_id
-    print(f"[TOPIC] âŒ FAILED: topic nahi ban saka", flush=True)
+    print(f"[TOPIC] ❌ FAILED: topic nahi ban saka", flush=True)
     return None
 
 
 # --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
 async def _fast_group_copy(client, group_id, topic_id, kind, file_id, cap, info):
-    """Fast path ke baad log-group topic me copy (bot ka apna file_id â€”
+    """Fast path ke baad log-group topic me copy (bot ka apna file_id —
     instant, server-side). Fail ho to bas log karo, delivery rukti nahi."""
     if not group_id:
         return
@@ -1365,7 +1366,7 @@ async def _direct_fast(client, dest_chat, group_id, topic_id, kind, file_id, cap
         print(f"Direct fast path failed ({info['msg_id']}): {e}", flush=True)
         return False
     await _fast_group_copy(client, group_id, topic_id, kind, file_id, cap, info)
-    print(f"âš¡ INSTANT (direct) msg {info['msg_id']}", flush=True)
+    print(f"⚡ INSTANT (direct) msg {info['msg_id']}", flush=True)
     return True
 
 
@@ -1379,7 +1380,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
     s = get_settings(uid)
     group_id = LOG_GROUP_ID
     # v43 caption helper: (1) original caption par remove/replace rules,
-    # (2) caption template REPLACE nahi â€” original ke NICHE append hoga,
+    # (2) caption template REPLACE nahi — original ke NICHE append hoga,
     # (3) phir bold. Slow path me rename ke baad naye naam se dobara
     # banane ke liye bhi yahi use hota hai.
     _orig_cap = info.get("caption") or ""
@@ -1412,26 +1413,27 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 entities = None
                 plain = text
                 if text.startswith("<b>") and text.endswith("</b>") and len(text) > 7:
+                    plain = text[3:-4]
+                    # HTML entities decode karo (length sahi ho)
                     import html as _html
-                    plain = _html.unescape(text[3:-4])
-                    # v46 FIX: Telegram entity length UTF-16 code units me ginta
-                    # hai â€” emoji wale text me Python len() chhota count karta
-                    # tha aur ENTITY_BOUNDS_INVALID aata tha. UTF-16 me gino.
-                    _u16 = len(plain.encode("utf-16-le")) // 2
+                    plain_decoded = _html.unescape(plain)
+                    # v46 FIX: entity length UTF-16 code units me
+                    _u16 = len(plain_decoded.encode("utf-16-le")) // 2
                     entities = [raw.types.MessageEntityBold(
                         offset=0, length=_u16)]
+                    plain = plain_decoded
                 try:
                     await client.invoke(raw.functions.messages.SendMessage(
                         peer=peer, message=plain,
                         random_id=_rand.randint(1, 2**63 - 1),
                         top_msg_id=topic_id, entities=entities))
                 except Exception:
-                    # Entity wala send fail ho to PLAIN text bhej do â€”
-                    # text pahunchana zaroori hai, bold optional hai
+                    # v46 FIX: entity send fail ho to plain text dobara bhejo,
+                    # taaki group copy ruk na jaye
                     await client.invoke(raw.functions.messages.SendMessage(
                         peer=peer, message=plain,
                         random_id=_rand.randint(1, 2**63 - 1),
-                        top_msg_id=topic_id))
+                        top_msg_id=topic_id, entities=None))
             else:
                 await client.send_message(
                     group_id, text, parse_mode=enums.ParseMode.HTML)
@@ -1452,14 +1454,14 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         if kind == "too_big":
             await client.send_message(
                 dest_chat,
-                f"âš ï¸ **Message {info['msg_id']}:** File 2GB se badi hai.",
+                f"⚠️ **Message {info['msg_id']}:** File 2GB se badi hai.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return False
 
         # === FAST PATH: file_id se INSTANT bhejo (sirf BOT ka apna file_id) ===
         # v44: transfer/instant-share path HATA DIYA (user demand). Ab instant
-        # sirf tab jab bot khud fetch karta ho (public source) â€” userbot wale
+        # sirf tab jab bot khud fetch karta ho (public source) — userbot wale
         # file_id par bot ke send karne ki koshish hi bekar thi (MEDIA_EMPTY),
         # isliye private source par seedha download+upload chalta hai.
         file_id = info.get("file_id")
@@ -1471,25 +1473,25 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             if ok:
                 info["delivered_fast"] = True
                 return True
-            print(f"Fast path failed ({info['msg_id']}) â€” downloading...",
+            print(f"Fast path failed ({info['msg_id']}) — downloading...",
                   flush=True)
 
         # === SLOW PATH: download + settings + upload ===
         # v44 PIPELINE: run_batch agli file pehle se background me download
-        # kar chuka hota hai â€” info["file_path"] mila to wahi use karo.
+        # kar chuka hota hai — info["file_path"] mila to wahi use karo.
         fp = info.get("file_path")
         if fp and os.path.exists(fp):
-            print(f"ðŸ“¦ Prefetch se file mil gayi msg {info['msg_id']} "
+            print(f"📦 Prefetch se file mil gayi msg {info['msg_id']} "
                   "(download pehle se ho chuki)", flush=True)
         else:
-            print(f"â¬‡ï¸ DOWNLOAD chal raha hai msg {info['msg_id']}", flush=True)
+            print(f"⬇️ DOWNLOAD chal raha hai msg {info['msg_id']}", flush=True)
             fp = await download_file(userbot, info, prog_msg, stats, uid, client)
         if not fp:
             _clean()
             return False
 
         # settings: filename (remove/replace/tag)
-        # v43: rename ke baad info["file_name"] bhi update â€” warna aage
+        # v43: rename ke baad info["file_name"] bhi update — warna aage
         # purana naam use hota tha aur rename ka asar gayab lagta tha.
         base = os.path.basename(fp)
         new_base = apply_filename_rules(base, s)
@@ -1532,7 +1534,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 last_update = [time.time()]
                 start_time = time.time()
                 pa = (prog_msg, start_time, last_update)
-                title = f"ðŸš€ Uploading â€¢ ID `{info.get('msg_id')}`"
+                title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
                 prog = {"progress": progress_bar,
                         "progress_args": pa + (title, stats, uid, client)}
             else:
@@ -1560,7 +1562,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 except Exception as e:
                     if "PHOTO_EXT_INVALID" in str(e):
                         # Photo ke roop me reject ho jaye to file/document
-                        # bana kar bhej do â€” image user ko mil hi jayegi
+                        # bana kar bhej do — image user ko mil hi jayegi
                         return await client.send_document(
                             dchat, document=fp, caption=cap, **kw, **cap_kw)
                     raise
@@ -1635,7 +1637,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
 
 async def _pin_status(client, chat_id, msg_id):
     """Batch status message ko pin karo. Bot private chats me Pyrogram se
-    pin NAHI kar sakta (BOT_ONESIDE_NOT_AVAIL â€” har file par error log hota
+    pin NAHI kar sakta (BOT_ONESIDE_NOT_AVAIL — har file par error log hota
     tha), isliye v40 me PEHLE Bot API try karte hain, Pyrogram sirf
     fallback hai. Returns True/False."""
     if BOT_TOKEN:
@@ -1665,12 +1667,12 @@ async def _pin_status(client, chat_id, msg_id):
 # --- BATCH RUNNER: SEQUENTIAL DELIVERY + PIPELINED DOWNLOAD (v44) ---
 # Delivery ORDER hamesha ek jaisa rehta hai (file 1, 2, 3...). Lekin v44 me
 # jab file N bot se UPLOAD ho rahi hoti hai, tab file N+1 userbot se
-# background me DOWNLOAD ho rahi hoti hai â€” dono alag network connection
+# background me DOWNLOAD ho rahi hoti hai — dono alag network connection
 # hain, isliye ek hi time me dono kaam hote hain aur batch lagbhag 2x tez.
-# Disk par max 2 files (current + next) â€” Koyeb free plan ke liye safe.
+# Disk par max 2 files (current + next) — Koyeb free plan ke liye safe.
 def _cleanup_prepared(holder):
     """Prefetch me download hui file ka temp folder saaf karo (jab wo
-    deliver nahi hui â€” cancel/skip case)."""
+    deliver nahi hui — cancel/skip case)."""
     info = (holder or {}).get("info")
     if isinstance(info, dict) and info.get("tmpdir"):
         shutil.rmtree(info["tmpdir"], ignore_errors=True)
@@ -1678,7 +1680,7 @@ def _cleanup_prepared(holder):
 
 def _drop_holder(holders, holder):
     """List se holder nikaal do (hai hi nahi to chup chap chhod do).
-    NOTE: holders LIST hona chahiye â€” dict set me add nahi hota
+    NOTE: holders LIST hona chahiye — dict set me add nahi hota
     (v44 me wahi TypeError aaya tha: 'unhashable type: dict')."""
     try:
         holders.remove(holder)
@@ -1688,7 +1690,7 @@ def _drop_holder(holders, holder):
 
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
-    # NAHI â€” public channel ko bot khud padh sakta hai, aur bot se fetch
+    # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
     # kiya gaya file_id BOT ka apna hota hai, isliye fast path (file_id
     # instant) bhi kaam karega. Private source (t.me/c/...) ke liye
     # pehle ki tarah user ka apna userbot session lagega.
@@ -1699,9 +1701,9 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     elif not userbot:
         await client.send_message(
             owner_id,
-            "âŒ **Pehle /login karke apne number se login karo.**",
+            "❌ **Pehle /login karke apne number se login karo.**",
         )
-        await safe_edit(status_msg, "âŒ **Login required. Pehle /login karo.**")
+        await safe_edit(status_msg, "❌ **Login required. Pehle /login karo.**")
         return
     else:
         fetch_client = userbot
@@ -1716,17 +1718,17 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Log group me user ke naam ka folder (topic) banao
     topic_id = await get_or_create_topic(userbot, owner_id)
     peer_msg = (
-        "âŒ **Channel/group nahi mila.**\n"
+        "❌ **Channel/group nahi mila.**\n"
         "Tumhara logged-in account is channel ka **member nahi hai**, "
         "ya link galat hai.\n"
-        "â€¢ Usi account se channel **join** karo jisse `/login` kiya tha\n"
-        "â€¢ Link bilkul usi channel ka hona chahiye\n"
+        "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
+        "• Link bilkul usi channel ka hona chahiye\n"
         "Phir dobara try karo."
     )
 
     # v44 PIPELINE: is file ka metadata + (zaroorat ho to) download. Jab ye
     # background task agli file ke liye chal raha hota hai, tab current file
-    # bot se upload ho rahi hoti hai â€” dono connections alag, time bachta hai.
+    # bot se upload ho rahi hoti hai — dono connections alag, time bachta hai.
     async def _prepare(mid, pre, holder):
         try:
             info = await fetch_one(fetch_client, src_chat, mid, preloaded=pre)
@@ -1754,17 +1756,17 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Status message ko PIN karo taaki upar dikhe (2 tareeke try honge)
     pinned = await _pin_status(client, owner_id, status_msg.id)
     try:
-        # Pinned batch status â€” live update hoga (sirf batch overview)
+        # Pinned batch status — live update hoga (sirf batch overview)
         await _update_batch_status(status_msg, stats, force=True)
         if not pinned:
             # Pehli koshish fail hui ho to ek baar aur try karo
             pinned = await _pin_status(client, owner_id, status_msg.id)
         prog_msg = None
-        holders = []        # prefetch holders (cleanup ke liye) â€” LIST, set nahi!
+        holders = []        # prefetch holders (cleanup ke liye) — LIST, set nahi!
         pending_task = None  # background prepare task (agli file ka)
         pending_mid = None
         pending_holder = None
-        # v40 SPEED: metadata CHUNK me fetch hota hai â€” 1 call me FETCH_CHUNK
+        # v40 SPEED: metadata CHUNK me fetch hota hai — 1 call me FETCH_CHUNK
         # (default 100) messages, pehle har message par alag call thi.
         i = 0
         while i < len(ids) and not cancel_event.is_set():
@@ -1773,7 +1775,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             if fetched == "BREAK":
                 await client.send_message(
                     owner_id,
-                    "âŒ **Error:** Userbot us private channel ka member nahi hai.",
+                    "❌ **Error:** Userbot us private channel ka member nahi hai.",
                 )
                 cancel_event.set()
                 break
@@ -1782,7 +1784,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     break
                 # STEP 1: metadata lao (pipeline se ya fresh)
                 if fetched is None:
-                    pre = None          # chunk fail â€” purana per-id fetch chlega
+                    pre = None          # chunk fail — purana per-id fetch chlega
                 elif mid in fetched:
                     pre = fetched[mid]  # chunk se mil gaya (network call skip)
                 else:
@@ -1814,7 +1816,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 if info == "BREAK":
                     await client.send_message(
                         owner_id,
-                        "âŒ **Error:** Userbot us private channel ka member nahi hai.",
+                        "❌ **Error:** Userbot us private channel ka member nahi hai.",
                     )
                     cancel_event.set()
                     break
@@ -1825,7 +1827,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     await _update_batch_status(status_msg, stats)
                     continue
                 # HAR FILE ke liye NAYA progress message (neeche se aayega)
-                # Purana delete karo, naya banao â€” taaki sent file ke neeche dikhe
+                # Purana delete karo, naya banao — taaki sent file ke neeche dikhe
                 if prog_msg:
                     try:
                         await prog_msg.delete()
@@ -1833,7 +1835,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                         pass
                 try:
                     prog_msg = await client.send_message(
-                        owner_id, "â³ **Taiyaar...**",
+                        owner_id, "⏳ **Taiyaar...**",
                         parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception:
                     prog_msg = None
@@ -1899,31 +1901,37 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
     if cancel_event.is_set() and (done < total):
-        await safe_edit(status_msg, "ðŸ›‘ **Batch stopped.**")
+        await safe_edit(status_msg, "🛑 **Batch stopped.**")
     else:
         await safe_edit(
             status_msg,
-            f"âœ… **Batch complete!**\nâœ”ï¸ Success: `{ok}` | âŒ Failed: `{fail}`",
+            f"✅ **Batch complete!**\n✔️ Success: `{ok}` | ❌ Failed: `{fail}`",
         )
 
 
 
 # --- v35: FORCE-JOIN + WELCOME PANELS (video wale reference bot jaisa) ---
-# v40: join-check ka result 5 min cache â€” har message par get_chat_member
+# v40: join-check ka result 5 min cache — har message par get_chat_member
 # call nahi hoti (kam requests = kam flood risk).
 _JOIN_CACHE = {}  # uid -> (joined_bool, timestamp)
 _JOIN_TTL = 300
 _JOIN_HINT_SHOWN = False
 
 
-async def _has_joined(uid):
+async def _has_joined(uid, force=False):
     """Force-join check. Channel set na ho ya user owner ho to hamesha True.
-    Check khud fail ho jaye to bhi True (fail-open) â€” bot is wajah se kabhi
+    Check khud fail ho jaye to bhi True (fail-open) — bot is wajah se kabhi
     band nahi hona chahiye. v40: PEER_ID_INVALID aane par channel ko ek baar
-    resolve karke retry karte hain (deploy ke baad peer cache cold hota hai)."""
+    resolve karke retry karte hain (deploy ke baad peer cache cold hota hai).
+    v46: UserNotParticipant = False (join wall dikhega, fail-open nahi).
+    v46.1: force=True cache bypass karta hai — user-initiated recheck
+    (/start, JOIN KAR LIYA button, /batch, /login) par 5-min False cache
+    user ko atakne nahi deta."""
     global _JOIN_HINT_SHOWN
     if not UPDATES_CHANNEL or _is_owner(uid):
         return True
+    if force:
+        _JOIN_CACHE.pop(uid, None)
     now = time.time()
     cached = _JOIN_CACHE.get(uid)
     if cached and (now - cached[1]) < _JOIN_TTL:
@@ -1938,13 +1946,11 @@ async def _has_joined(uid):
             enums.ChatMemberStatus.RESTRICTED,
         )
     except UserNotParticipant:
-        # v46 FIX: ye ERROR nahi hai â€” iska matlab user ne channel JOIN
-        # NAHI kiya. Pehle isko fail-open maan kar user ko pass kar dete
-        # the (force-join bypass ho jata tha). Ab join wall dikhega.
+        # v46 FIX: channel join nahi kiya = False, fail-open True nahi
         verdict = False
     except Exception as e:
         if "PEER_ID_INVALID" in str(e):
-            # Channel ka peer bot ke session cache me nahi hai â€” ek baar
+            # Channel ka peer bot ke session cache me nahi hai — ek baar
             # get_chat se resolve karke retry karo (cache warm ho jata hai)
             try:
                 await app.get_chat(UPDATES_CHANNEL)
@@ -1956,6 +1962,7 @@ async def _has_joined(uid):
                     enums.ChatMemberStatus.RESTRICTED,
                 )
             except UserNotParticipant:
+                # v46 FIX: retry path me bhi join nahi = False
                 verdict = False
             except Exception as e2:
                 e = e2
@@ -1975,23 +1982,33 @@ async def _has_joined(uid):
 
 def _join_kb():
     rows = []
-    ch = UPDATES_CHANNEL.lstrip("@")
+    # v46.1 FIX: UPDATES_CHANNEL t.me link ho to usme se username nikalo,
+    # warna button https://t.me/https://... ban jata tha (toota hua link)
+    ch = UPDATES_CHANNEL.strip().lstrip("@")
+    for _prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if ch.startswith(_prefix):
+            ch = ch[len(_prefix):]
+            break
+    ch = ch.strip("/").split("/")[0].split("?")[0] if ch else ""
+    # NOTE: numeric -100... ID se public t.me link ban hi nahi sakta —
+    # isliye numeric value par button nahi aayega. Wall kaam karne ke liye
+    # UPDATES_CHANNEL me bare @username hona zaroori hai.
     if ch and not ch.lstrip("-").isdigit():
         rows.append([InlineKeyboardButton(
-            "ðŸ¤– JOIN UPDATES CHANNEL ðŸ¤–", url=f"https://t.me/{ch}")])
+            "🤖 JOIN UPDATES CHANNEL 🤖", url=f"https://t.me/{ch}")])
     rows.append([InlineKeyboardButton(
-        "âœ… JOIN KAR LIYA â€” CHECK KARO", callback_data="home_joined")])
+        "✅ JOIN KAR LIYA — CHECK KARO", callback_data="home_joined")])
     return InlineKeyboardMarkup(rows)
 
 
 JOIN_WALL_TEXT = (
-    "**âš ï¸ Attention âš ï¸**\n\n"
-    "**ðŸ“¢ Is bot ko use karne ke liye pehle hamara**\n"
+    "**⚠️ Attention ⚠️**\n\n"
+    "**📢 Is bot ko use karne ke liye pehle hamara**\n"
     "**updates channel join karna hoga!**\n\n"
-    "**âœ… Required Action:**\n"
+    "**✅ Required Action:**\n"
     "**1. Neeche wale button se channel JOIN karo**\n"
-    "**2. Wapas aakar `/start` dabao ya âœ… button dabao**\n\n"
-    "**ðŸš« Access restricted until you join!**"
+    "**2. Wapas aakar `/start` dabao ya ✅ button dabao**\n\n"
+    "**🚫 Access restricted until you join!**"
 )
 
 
@@ -2011,93 +2028,93 @@ async def _send_join_wall(message):
 
 def _welcome_text(uid):
     has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
-    login = "ðŸŸ¢ Logged in" if has_session else "ðŸ”´ Not logged in (/login karo)"
-    access = "âœ… Allowed" if _is_allowed(uid) else "â›” Not allowed"
+    login = "🟢 Logged in" if has_session else "🔴 Not logged in (/login karo)"
+    access = "✅ Allowed" if _is_allowed(uid) else "⛔ Not allowed"
     return (
-        "**ðŸš€ Welcome to VILLAN Restriction Bot ðŸ¦…**\n\n"
-        "**ðŸŒŸ *Private/Restricted content save karne ka sabse fast tareeka***\n\n"
-        "**ðŸ“Œ Key Features:**\n"
-        "**- ðŸ›¡ï¸ Restriction Bypass â€” save-restricted videos/files nikalo**\n"
-        "**- âš¡ File-ID Fast Path â€” supported files bilkul instant**\n"
-        "**- ðŸ“¦ Bulk Batch â€” ek saath 1000 tak links**\n"
-        "**- ðŸ”„ Public + Private â€” dono tarah ke channels**\n"
-        "**- ðŸŽ›ï¸ Full Customize â€” rename, caption, watermark, thumbnail**\n\n"
-        "**ðŸŽ¯ Perfect For:**\n"
-        "**- Course / content collectors ðŸ“š**\n"
-        "**- Channel admins ðŸ”„**\n"
-        "**- Limited data wale users ðŸ“¶**\n\n"
-        f"**ðŸ”‘ Login:** {login}\n"
-        f"**ðŸ›¡ï¸ Access:** {access}\n"
-        f"**ðŸ‘‘ Owner:** {OWNER_USERNAME}"
+        "**🚀 Welcome to VILLAN Restriction Bot 🦅**\n\n"
+        "**🌟 *Private/Restricted content save karne ka sabse fast tareeka***\n\n"
+        "**📌 Key Features:**\n"
+        "**- 🛡️ Restriction Bypass — save-restricted videos/files nikalo**\n"
+        "**- ⚡ File-ID Fast Path — supported files bilkul instant**\n"
+        "**- 📦 Bulk Batch — ek saath 1000 tak links**\n"
+        "**- 🔄 Public + Private — dono tarah ke channels**\n"
+        "**- 🎛️ Full Customize — rename, caption, watermark, thumbnail**\n\n"
+        "**🎯 Perfect For:**\n"
+        "**- Course / content collectors 📚**\n"
+        "**- Channel admins 🔄**\n"
+        "**- Limited data wale users 📶**\n\n"
+        f"**🔑 Login:** {login}\n"
+        f"**🛡️ Access:** {access}\n"
+        f"**👑 Owner:** {OWNER_USERNAME}"
     )
 
 
 def _welcome_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ðŸ‘‘ ADMIN PANEL", callback_data="home_admin")],
-        [InlineKeyboardButton("ðŸ“‹ COMMANDS", callback_data="home_commands")],
-        [InlineKeyboardButton("ðŸ“œ DISCLAIMER", callback_data="home_disclaimer"),
-         InlineKeyboardButton("âš ï¸ WARNINGS", callback_data="home_warnings")],
-        [InlineKeyboardButton("âŒ CLOSE", callback_data="home_close")],
+        [InlineKeyboardButton("👑 ADMIN PANEL", callback_data="home_admin")],
+        [InlineKeyboardButton("📋 COMMANDS", callback_data="home_commands")],
+        [InlineKeyboardButton("📜 DISCLAIMER", callback_data="home_disclaimer"),
+         InlineKeyboardButton("⚠️ WARNINGS", callback_data="home_warnings")],
+        [InlineKeyboardButton("❌ CLOSE", callback_data="home_close")],
     ])
 
 
 def _page_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("â¬…ï¸ BACK", callback_data="home_start"),
-         InlineKeyboardButton("âŒ CLOSE", callback_data="home_close")],
+        [InlineKeyboardButton("⬅️ BACK", callback_data="home_start"),
+         InlineKeyboardButton("❌ CLOSE", callback_data="home_close")],
     ])
 
 
 COMMANDS_TEXT = (
-    "**ðŸ“‹ COMMANDS**\n\n"
-    "**ðŸ‘¤ User Commands:**\n"
-    "**â€¢ `/login` â€” Apne number se login**\n"
-    "**â€¢ `/logout` â€” Session khatam karo**\n"
-    "**â€¢ `/batch` â€” Bulk extraction (range)**\n"
-    "**â€¢ `/settings` â€” Customize panel**\n"
-    "**â€¢ `/plan` â€” Apna plan dekho**\n"
-    "**â€¢ `/buy` â€” Premium kharido**\n"
-    "**â€¢ `/help` â€” Usage guide**\n"
-    "**â€¢ `/cancel` â€” Chal raha task roko**\n"
-    "**â€¢ Direct link bhejo â€” single file extract**\n\n"
-    "**ðŸ‘‘ Owner Commands:**\n"
-    "**â€¢ `/paid <id> <days>` â€¢ `/allow` â€¢ `/unallow` â€¢ `/users`**"
+    "**📋 COMMANDS**\n\n"
+    "**👤 User Commands:**\n"
+    "**• `/login` — Apne number se login**\n"
+    "**• `/logout` — Session khatam karo**\n"
+    "**• `/batch` — Bulk extraction (range)**\n"
+    "**• `/settings` — Customize panel**\n"
+    "**• `/plan` — Apna plan dekho**\n"
+    "**• `/buy` — Premium kharido**\n"
+    "**• `/help` — Usage guide**\n"
+    "**• `/cancel` — Chal raha task roko**\n"
+    "**• Direct link bhejo — single file extract**\n\n"
+    "**👑 Owner Commands:**\n"
+    "**• `/paid <id> <days>` • `/allow` • `/unallow` • `/users`**"
 )
 
 DISCLAIMER_TEXT = (
-    "**âš–ï¸ Legal Notice**\n\n"
+    "**⚖️ Legal Notice**\n\n"
     "**Ye bot:**\n"
-    "**â€¢ Koi file store nahi karta**\n"
-    "**â€¢ Kisi illegal activity ko endorse nahi karta**\n"
-    "**â€¢ Sirf tools provide karta hai**\n"
-    "**â€¢ Users apne actions ke khud zimmedar hain**\n\n"
+    "**• Koi file store nahi karta**\n"
+    "**• Kisi illegal activity ko endorse nahi karta**\n"
+    "**• Sirf tools provide karta hai**\n"
+    "**• Users apne actions ke khud zimmedar hain**\n\n"
     "**Bot use karke tum agree karte ho:**\n"
-    "**â€¢ Local laws follow karoge**\n"
-    "**â€¢ Copyright material ka abuse nahi karoge**\n"
-    "**â€¢ Saare risks tumhare khud ke honge**"
+    "**• Local laws follow karoge**\n"
+    "**• Copyright material ka abuse nahi karoge**\n"
+    "**• Saare risks tumhare khud ke honge**"
 )
 
 WARNINGS_TEXT = (
-    "**ðŸ”ž Safety First!**\n\n"
-    "**ðŸš« Apna session string kabhi kisi ke saath share mat karo**\n"
-    "**ðŸ›¡ï¸ Testing ke liye secondary accounts use karo**\n"
-    "**âš–ï¸ Copyright laws ka respect karo**\n"
-    "**ðŸ’¡ Security ke liye saari activities log hoti hain**\n\n"
-    "**âŒ Strictly Prohibited:**\n"
-    "**â€¢ Child exploitation material**\n"
-    "**â€¢ Copyright infringement**\n"
-    "**â€¢ Scam / Phishing attempts**\n"
-    "**â€¢ Illegal transactions**"
+    "**🔞 Safety First!**\n\n"
+    "**🚫 Apna session string kabhi kisi ke saath share mat karo**\n"
+    "**🛡️ Testing ke liye secondary accounts use karo**\n"
+    "**⚖️ Copyright laws ka respect karo**\n"
+    "**💡 Security ke liye saari activities log hoti hain**\n\n"
+    "**❌ Strictly Prohibited:**\n"
+    "**• Child exploitation material**\n"
+    "**• Copyright infringement**\n"
+    "**• Scam / Phishing attempts**\n"
+    "**• Illegal transactions**"
 )
 
 ADMIN_TEXT = (
-    "**ðŸ‘‘ ADMIN PANEL**\n\n"
-    "**â€¢ `/paid <user_id> <days>` â€” Premium plan do**\n"
-    "**â€¢ `/allow <user_id>` â€” Lifetime free access**\n"
-    "**â€¢ `/unallow <user_id>` â€” Access hatao**\n"
-    "**â€¢ `/users` â€” Paid + allowed users ki list**\n\n"
-    "**Payment manual hai (UPI) â€” plan yahi se activate hota hai.**"
+    "**👑 ADMIN PANEL**\n\n"
+    "**• `/paid <user_id> <days>` — Premium plan do**\n"
+    "**• `/allow <user_id>` — Lifetime free access**\n"
+    "**• `/unallow <user_id>` — Access hatao**\n"
+    "**• `/users` — Paid + allowed users ki list**\n\n"
+    "**Payment manual hai (UPI) — plan yahi se activate hota hai.**"
 )
 
 
@@ -2140,12 +2157,12 @@ async def _handle_home_callbacks(client, query, uid, data):
             pass
         return
     if data == "home_joined":
-        if await _has_joined(uid):
+        if await _has_joined(uid, force=True):
             await _edit_panel(query, _welcome_text(uid), _welcome_kb())
         else:
             try:
                 await query.answer(
-                    "âŒ Abhi bhi join nahi dikh raha. Pehle channel join karo!",
+                    "❌ Abhi bhi join nahi dikh raha. Pehle channel join karo!",
                     show_alert=True)
             except Exception:
                 pass
@@ -2167,7 +2184,7 @@ async def _handle_home_callbacks(client, query, uid, data):
             await _edit_panel(query, ADMIN_TEXT, _page_kb())
         else:
             try:
-                await query.answer("â›” Ye sirf owner ke liye hai.", show_alert=True)
+                await query.answer("⛔ Ye sirf owner ke liye hai.", show_alert=True)
             except Exception:
                 pass
         return
@@ -2177,9 +2194,10 @@ async def _handle_home_callbacks(client, query, uid, data):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
     uid = message.chat.id
-    print(f"âš¡ Processing /start for user {uid}", flush=True)
+    print(f"⚡ Processing /start for user {uid}", flush=True)
     # v35: Force-join gate (UPDATES_CHANNEL set ho tabhi)
-    if not await _has_joined(uid):
+    # v46.1: /start user-initiated recheck hai, cache bypass karo
+    if not await _has_joined(uid, force=True):
         await _send_join_wall(message)
         return
     await _send_welcome(message, uid)
@@ -2205,7 +2223,7 @@ async def cancel_handler(client, message):
         ev.set()
         hit = True
     if hit:
-        await message.reply_text("ðŸ›‘ **VILLAN Engine:** Task cancel kar diya gaya hai.")
+        await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
     else:
         await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
 
@@ -2215,7 +2233,7 @@ async def cancel_handler(client, message):
 async def allow_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("â›” Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
         return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
@@ -2228,7 +2246,7 @@ async def allow_handler(client, message):
     allowed.add(target)
     _save_allowed(allowed)
     await message.reply_text(
-        f"âœ… `{target}` ko permission mil gayi.\nAb wo `/login` karke bot use kar sakta hai."
+        f"✅ `{target}` ko permission mil gayi.\nAb wo `/login` karke bot use kar sakta hai."
     )
 
 
@@ -2236,7 +2254,7 @@ async def allow_handler(client, message):
 async def unallow_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("â›” Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
         return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
@@ -2254,27 +2272,27 @@ async def unallow_handler(client, message):
     if ev is not None:
         ev.set()
     await _logout_user(target)
-    await message.reply_text(f"ðŸš« `{target}` ki permission hata di gayi.")
+    await message.reply_text(f"🚫 `{target}` ki permission hata di gayi.")
 
 
 @app.on_message(filters.command("users") & filters.private)
 async def users_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("â›” Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
         return
     free = sorted(u for u in _get_allowed() if u != OWNER_ID)
-    free_lines = "\n".join(f"â€¢ `{x}`" for x in free) or "â€”"
+    free_lines = "\n".join(f"• `{x}`" for x in free) or "—"
     subs = _load_subs()
     now = time.time()
     paid_lines = []
     for k in sorted((kk for kk in subs if kk.isdigit()), key=int):
         rem_days = (subs[k].get("expiry", 0) - now) / 86400
         if rem_days > 0:
-            paid_lines.append(f"â€¢ `{k}` â€” `{rem_days:.1f}` din bache")
-    paid_text = "\n".join(paid_lines) or "â€”"
+            paid_lines.append(f"• `{k}` — `{rem_days:.1f}` din bache")
+    paid_text = "\n".join(paid_lines) or "—"
     await message.reply_text(
-        f"ðŸ‘¥ **Free users:**\n{free_lines}\n\nðŸ’Ž **Paid users:**\n{paid_text}"
+        f"👥 **Free users:**\n{free_lines}\n\n💎 **Paid users:**\n{paid_text}"
     )
 
 
@@ -2283,7 +2301,7 @@ async def paid_handler(client, message):
     """Owner kisi ko time-based paid access de: /paid <user_id> <days>"""
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("â›” Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
         return
     parts = message.text.split()
     if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
@@ -2293,7 +2311,7 @@ async def paid_handler(client, message):
         return
     target, days = int(parts[1]), int(parts[2])
     if days <= 0 or days > 3650:
-        await message.reply_text("âŒ Days 1 se 3650 ke beech hone chahiye.")
+        await message.reply_text("❌ Days 1 se 3650 ke beech hone chahiye.")
         return
     subs = _load_subs()
     now = time.time()
@@ -2302,12 +2320,12 @@ async def paid_handler(client, message):
     _save_subs(subs)
     card = await _premium_card(target, client)
     await message.reply_text(
-        f"âœ… Premium activate ho gaya!\n\n{card}"
+        f"✅ Premium activate ho gaya!\n\n{card}"
     )
     try:
         await client.send_message(
             target,
-            f"ðŸŽ‰ Tumhe **{days} din** ka premium access mil gaya hai!\n\n{card}\n\n"
+            f"🎉 Tumhe **{days} din** ka premium access mil gaya hai!\n\n{card}\n\n"
             "`/login` karke shuru karo.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
@@ -2320,37 +2338,37 @@ async def plan_handler(client, message):
     """User apna plan premium card style me dekhe."""
     uid = message.chat.id
     if not _is_allowed(uid):
-        await message.reply_text("â›” Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
     card = await _premium_card(uid, client)
     has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
-    login = "ðŸŸ¢ Logged in" if has_session else "ðŸ”´ Not logged in (`/login` karo)"
-    await message.reply_text(f"{card}\n\nðŸ”‘ {login}")
+    login = "🟢 Logged in" if has_session else "🔴 Not logged in (`/login` karo)"
+    await message.reply_text(f"{card}\n\n🔑 {login}")
 
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client, message):
-    """Bot kaise use karein â€” poori guide."""
+    """Bot kaise use karein — poori guide."""
     help_text = (
-        "ðŸ¦… **VILLAN BOT â€” HELP**\n\n"
+        "🦅 **VILLAN BOT — HELP**\n\n"
         "**Bot kaise use karein:**\n\n"
-        "1ï¸âƒ£ `/login` â€” Apne Telegram number se login karo\n"
+        "1️⃣ `/login` — Apne Telegram number se login karo\n"
         "   (OTP aayega, 2-step password ho to wo bhi)\n\n"
-        "2ï¸âƒ£ `/batch` â€” Phir channel ka **start link** bhejo,\n"
+        "2️⃣ `/batch` — Phir channel ka **start link** bhejo,\n"
         "   phir **end link** bhejo\n"
         "   _Ya seedha ek message me range bhejo:_\n"
         "   `https://t.me/c/123456789/100-110`\n\n"
-        "3ï¸âƒ£ Files tumhe mil jayengi âš¡\n\n"
+        "3️⃣ Files tumhe mil jayengi ⚡\n\n"
         "**Commands:**\n"
-        "â€¢ `/start` â€” Bot shuru karo\n"
-        "â€¢ `/login` â€” Number se login\n"
-        "â€¢ `/logout` â€” Logout\n"
-        "â€¢ `/batch` â€” Batch download\n"
-        "â€¢ `/settings` â€” Rename, caption, watermark\n"
-        "â€¢ `/plan` â€” Apna plan dekho\n"
-        "â€¢ `/buy` â€” Premium kharido\n"
-        "â€¢ `/cancel` â€” Chal raha kaam roko\n\n"
-        f"ðŸ‘‘ **Owner:** `{OWNER_USERNAME}`\n"
+        "• `/start` — Bot shuru karo\n"
+        "• `/login` — Number se login\n"
+        "• `/logout` — Logout\n"
+        "• `/batch` — Batch download\n"
+        "• `/settings` — Rename, caption, watermark\n"
+        "• `/plan` — Apna plan dekho\n"
+        "• `/buy` — Premium kharido\n"
+        "• `/cancel` — Chal raha kaam roko\n\n"
+        f"👑 **Owner:** `{OWNER_USERNAME}`\n"
         "_Access ya premium ke liye owner se contact karo._"
     )
     await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
@@ -2360,12 +2378,12 @@ async def help_handler(client, message):
 async def buy_handler(client, message):
     """Premium kharidne ke liye owner ka username dikhao."""
     await message.reply_text(
-        "ðŸ’Ž **VILLAN PREMIUM** ðŸ’Ž\n\n"
+        "💎 **VILLAN PREMIUM** 💎\n\n"
         "Premium lene ke liye owner se contact karo:\n"
-        f"ðŸ‘‘ `{OWNER_USERNAME}`\n\n"
+        f"👑 `{OWNER_USERNAME}`\n\n"
         "Unhe message karo:\n"
         "`Hi, mujhe premium chahiye`\n\n"
-        "Payment ke baad tumhara plan activate ho jayega! ðŸš€",
+        "Payment ke baad tumhara plan activate ho jayega! 🚀",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -2376,30 +2394,30 @@ async def logout_handler(client, message):
     await _cleanup_login(uid)
     await _logout_user(uid)
     await message.reply_text(
-        "ðŸ‘‹ Logout ho gaya. Dobara use karne ke liye `/login` karo."
+        "👋 Logout ho gaya. Dobara use karne ke liye `/login` karo."
     )
 
 
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_start_handler(client, message):
-    if not await _has_joined(message.chat.id):
+    if not await _has_joined(message.chat.id, force=True):
         await _send_join_wall(message)
         return
     if not _is_allowed(message.chat.id):
-        await message.reply_text("â›” Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
-    print(f"âš¡ Processing /batch for user {message.chat.id}", flush=True)
+    print(f"⚡ Processing /batch for user {message.chat.id}", flush=True)
     # Purani adhuri setting-input state ho to hatao, warna batch ka link
     # galti se setting handler me chala jayega
     SETTING_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
-        "**ðŸ”— VILLAN BATCH SYSTEM**\n"
-        "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-        "**STEP 1/2 â€” Source Selection**\n\n"
-        "**ðŸ“Ž Start message ka link bhejein**\n"
+        "**🔗 VILLAN BATCH SYSTEM**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        "**STEP 1/2 — Source Selection**\n\n"
+        "**📎 Start message ka link bhejein**\n"
         "**jahan se extraction shuru karna hai.**\n\n"
-        "**âŒ Cancel:** `/cancel`",
+        "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -2417,24 +2435,24 @@ async def _cleanup_login(uid):
 @app.on_message(filters.command("login") & filters.private)
 async def login_start_handler(client, message):
     uid = message.chat.id
-    if not await _has_joined(uid):
+    if not await _has_joined(uid, force=True):
         await _send_join_wall(message)
         return
     if not _is_allowed(uid):
         await message.reply_text(
-            "â›” Tumhe is bot ki permission nahi hai. Owner se contact karo."
+            "⛔ Tumhe is bot ki permission nahi hai. Owner se contact karo."
         )
         return
     await _cleanup_login(uid)
     LOGIN_STATES[uid] = {"step": "PHONE"}
     await message.reply_text(
-        "**ðŸ“± SECURE LOGIN**\n"
-        "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-        "**STEP 1/3 â€” Phone Number**\n\n"
-        "**ðŸ“ž Apna phone number bhejein**\n"
+        "**📱 SECURE LOGIN**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        "**STEP 1/3 — Phone Number**\n\n"
+        "**📞 Apna phone number bhejein**\n"
         "**country code ke saath**\n"
         "**Example:** `+919876543210`\n\n"
-        "**âŒ Cancel:** `/cancel`",
+        "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -2446,7 +2464,7 @@ async def _finish_login(client, message, st):
         me = await tmp.get_me()
         sess = await tmp.export_session_string()
     except Exception as e:
-        await message.reply_text(f"âŒ Session banane me error: `{e}`")
+        await message.reply_text(f"❌ Session banane me error: `{e}`")
         await _cleanup_login(uid)
         return
     # Purana session ho to hatao, naya save karo, aur isi connected
@@ -2465,16 +2483,16 @@ async def _finish_login(client, message, st):
 
     name = f"@{me.username}" if me.username else me.first_name
     await message.reply_text(
-        "**âœ… LOGIN SUCCESSFUL**\n"
-        "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-        f"**ðŸŽ‰ Welcome, {name}!**\n\n"
-        "**ðŸ”— Account successfully linked!**\n\n"
-        "**ðŸ“Œ Next Steps:**\n"
-        "**â€¢ /batch â€” Bulk extraction**\n"
-        "**â€¢ Channel link â€” Direct extract**\n\n"
-        "**âš ï¸ Security: OTP/password wale**\n"
+        "**✅ LOGIN SUCCESSFUL**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        f"**🎉 Welcome, {name}!**\n\n"
+        "**🔗 Account successfully linked!**\n\n"
+        "**📌 Next Steps:**\n"
+        "**• /batch — Bulk extraction**\n"
+        "**• Channel link — Direct extract**\n\n"
+        "**⚠️ Security: OTP/password wale**\n"
         "**messages delete kar dein.**\n\n"
-        "**ðŸšª Logout:** `/logout`",
+        "**🚪 Logout:** `/logout`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
     try:
@@ -2494,7 +2512,7 @@ async def handle_login_step(client, message):
         phone = re.sub(r"[\s\-()]", "", text)
         if not re.fullmatch(r"\+\d{7,15}", phone):
             await message.reply_text(
-                "âŒ Number sahi format me bhejo, jaise `+919876543210`"
+                "❌ Number sahi format me bhejo, jaise `+919876543210`"
             )
             return
         tmp = Client(
@@ -2509,7 +2527,7 @@ async def handle_login_step(client, message):
             except Exception:
                 pass
             await message.reply_text(
-                f"â³ Telegram ne rok diya hai. `{e.value}` sec baad `/login` dobara try karo."
+                f"⏳ Telegram ne rok diya hai. `{e.value}` sec baad `/login` dobara try karo."
             )
             await _cleanup_login(uid)
             return
@@ -2518,7 +2536,7 @@ async def handle_login_step(client, message):
                 await tmp.disconnect()
             except Exception:
                 pass
-            await message.reply_text(f"âŒ Number me problem hai: `{e}`")
+            await message.reply_text(f"❌ Number me problem hai: `{e}`")
             await _cleanup_login(uid)
             return
         except Exception as e:
@@ -2526,7 +2544,7 @@ async def handle_login_step(client, message):
                 await tmp.disconnect()
             except Exception:
                 pass
-            await message.reply_text(f"âŒ Code bhejne me error: `{e}`")
+            await message.reply_text(f"❌ Code bhejne me error: `{e}`")
             await _cleanup_login(uid)
             return
         st.update({
@@ -2538,23 +2556,23 @@ async def handle_login_step(client, message):
         code_type = str(getattr(sent, "type", "") or "")
         print(f"[LOGIN] code sent -> type={code_type}", flush=True)
         if "SMS" in code_type:
-            hint = ("**ðŸ“± Code SMS se bheja gaya hai â€”**\n"
+            hint = ("**📱 Code SMS se bheja gaya hai —**\n"
                     "**apne SMS inbox me check karo.**")
         elif "CALL" in code_type:
-            hint = "**ðŸ“ž Code CALL par aayega â€” call ka wait karo.**"
+            hint = "**📞 Code CALL par aayega — call ka wait karo.**"
         else:
-            hint = ("**ðŸ“± Code SMS par NAHI aayega!**\n"
+            hint = ("**📱 Code SMS par NAHI aayega!**\n"
                     "**Telegram app ke andar 'Telegram' naam wali**\n"
                     "**official chat me aayega.**\n"
                     "**Jis device me ye number login hai,**\n"
                     "**wahan chat list me sabse upar dekho.**")
         await message.reply_text(
-            "**ðŸ“© VERIFICATION**\n"
-            "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-            "**STEP 2/3 â€” OTP Code**\n\n"
+            "**📩 VERIFICATION**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 2/3 — OTP Code**\n\n"
             f"{hint}\n\n"
-            "**ðŸ”‘ Wo OTP code yahan bhejein.**\n\n"
-            "**âŒ Cancel:** `/cancel`",
+            "**🔑 Wo OTP code yahan bhejein.**\n\n"
+            "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -2562,41 +2580,41 @@ async def handle_login_step(client, message):
     if st["step"] == "OTP":
         otp = re.sub(r"\D", "", text)
         if len(otp) < 4:
-            await message.reply_text("âŒ Sahi OTP bhejo.")
+            await message.reply_text("❌ Sahi OTP bhejo.")
             return
         tmp = st["tmp"]
         try:
             await tmp.sign_in(st["phone"], st["phone_code_hash"], otp)
         except PhoneCodeInvalid:
-            await message.reply_text("âŒ OTP galat hai, dobara bhejo.")
+            await message.reply_text("❌ OTP galat hai, dobara bhejo.")
             return
         except PhoneCodeExpired:
             await message.reply_text(
-                "âŒ OTP expire ho gaya. `/login` se dobara shuru karo."
+                "❌ OTP expire ho gaya. `/login` se dobara shuru karo."
             )
             await _cleanup_login(uid)
             return
         except SessionPasswordNeeded:
             st["step"] = "PASSWORD"
             await message.reply_text(
-                "**ðŸ” 2-STEP VERIFICATION**\n"
-                "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-                "**STEP 3/3 â€” Password**\n\n"
-                "**ðŸ›¡ï¸ Is account par 2-step verification**\n"
+                "**🔐 2-STEP VERIFICATION**\n"
+                "**━━━━━━━━━━━━━━━**\n"
+                "**STEP 3/3 — Password**\n\n"
+                "**🛡️ Is account par 2-step verification**\n"
                 "**enabled hai.**\n\n"
-                "**ðŸ”‘ Apna password bhejein.**\n\n"
-                "**âš ï¸ Ye message baad me delete kar dein.**\n\n"
-                "**âŒ Cancel:** `/cancel`",
+                "**🔑 Apna password bhejein.**\n\n"
+                "**⚠️ Ye message baad me delete kar dein.**\n\n"
+                "**❌ Cancel:** `/cancel`",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
         except FloodWait as e:
             await message.reply_text(
-                f"â³ `{e.value}` sec wait karke OTP dobara bhejo."
+                f"⏳ `{e.value}` sec wait karke OTP dobara bhejo."
             )
             return
         except Exception as e:
-            await message.reply_text(f"âŒ Login fail: `{e}`")
+            await message.reply_text(f"❌ Login fail: `{e}`")
             await _cleanup_login(uid)
             return
         await _finish_login(client, message, st)
@@ -2607,10 +2625,10 @@ async def handle_login_step(client, message):
         try:
             await tmp.check_password(text)
         except PasswordHashInvalid:
-            await message.reply_text("âŒ Password galat hai, dobara bhejo.")
+            await message.reply_text("❌ Password galat hai, dobara bhejo.")
             return
         except Exception as e:
-            await message.reply_text(f"âŒ Login fail: `{e}`")
+            await message.reply_text(f"❌ Login fail: `{e}`")
             await _cleanup_login(uid)
             return
         await _finish_login(client, message, st)
@@ -2661,7 +2679,7 @@ def reset_settings(uid):
 
 def settings_keyboard(uid):
     s = get_settings(uid)
-    on = lambda v: "âœ…" if v else ""
+    on = lambda v: "✅" if v else ""
     um = "Document" if s["upload_as_doc"] else "Auto"
     kb = [
         [InlineKeyboardButton("Set Chat ID", callback_data="st_chat"),
@@ -2681,7 +2699,7 @@ def settings_keyboard(uid):
                               callback_data="st_videowm")],
         [InlineKeyboardButton(f"Upload Method: {um}",
                               callback_data="st_uploadmethod")],
-        [InlineKeyboardButton("Report Errors â†—", callback_data="st_report")],
+        [InlineKeyboardButton("Report Errors ↗", callback_data="st_report")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -2689,7 +2707,7 @@ def settings_keyboard(uid):
 def apply_text_rules(text, s):
     """Caption/text par remove_words -> replace_words lagao (case-insensitive).
     v43: pehle ye rules sirf filename par lagte the, isliye caption dekh
-    kar lagta tha 'kaam nahi kar raha' â€” ab caption/text par bhi lagenge."""
+    kar lagta tha 'kaam nahi kar raha' — ab caption/text par bhi lagenge."""
     out = text or ""
     for w in s.get("remove_words", []):
         if w:
@@ -2704,7 +2722,7 @@ def apply_text_rules(text, s):
 
 def apply_filename_rules(filename, s):
     """remove_words -> replace_words -> rename_tag lagao (filename par).
-    v43: matching case-insensitive â€” 'JOIN' bhi 'join' rule se hatega."""
+    v43: matching case-insensitive — 'JOIN' bhi 'join' rule se hatega."""
     name, ext = os.path.splitext(filename)
     name = apply_text_rules(name, s)
     name = re.sub(r"\.{2,}", ".", name)
@@ -2778,10 +2796,10 @@ def apply_video_watermark(video_path, text, tmpdir):
 async def settings_handler(client, message):
     uid = message.chat.id
     if not _is_allowed(uid):
-        await message.reply_text("â›” Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
     await message.reply_text(
-        "âš™ï¸ **Customize by your end and Configure your settings...**",
+        "⚙️ **Customize by your end and Configure your settings...**",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=settings_keyboard(uid),
     )
@@ -2798,7 +2816,7 @@ async def settings_callbacks(client, query):
         return
     if not _is_allowed(uid):
         try:
-            await query.answer("â›” Permission nahi hai.", show_alert=True)
+            await query.answer("⛔ Permission nahi hai.", show_alert=True)
         except Exception:
             pass
         return
@@ -2810,85 +2828,85 @@ async def settings_callbacks(client, query):
     if data == "st_chat":
         SETTING_STATES[uid] = {"action": "set_chat_id"}
         await query.message.reply_text(
-            "ðŸ“¨ **Set Chat ID**\n\nFiles kis chat me bheji jayein, wo ID bhejo\n"
+            "📨 **Set Chat ID**\n\nFiles kis chat me bheji jayein, wo ID bhejo\n"
             "(jaise `-1001234567890`).\nWapas apne paas bhejne ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_rename":
         SETTING_STATES[uid] = {"action": "set_rename"}
         await query.message.reply_text(
-            "ðŸ·ï¸ **Set Rename Tag**\n\nEk tag bhejo, file ka naam `[Tag] naam.ext` hoga.\n"
+            "🏷️ **Set Rename Tag**\n\nEk tag bhejo, file ka naam `[Tag] naam.ext` hoga.\n"
             "Hatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_caption":
         SETTING_STATES[uid] = {"action": "set_caption"}
         await query.message.reply_text(
-            "ðŸ’¬ **Caption**\n\nYe text original caption ke NICHE add hoga (purana caption hataya nahi jayega). `{filename}` likhne par file ka naam aayega.\n"
-            "Jaise: `ðŸ”¥ {filename}`\nHatane ke liye `off` bhejo.",
+            "💬 **Caption**\n\nYe text original caption ke NICHE add hoga (purana caption hataya nahi jayega). `{filename}` likhne par file ka naam aayega.\n"
+            "Jaise: `🔥 {filename}`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_replace":
         SETTING_STATES[uid] = {"action": "set_replace"}
         await query.message.reply_text(
-            "ðŸ”„ **Replace Words**\n\nHar line par `purana | naya` bhejo. Ye caption, text aur filename â€” teeno par lagega.\n"
+            "🔄 **Replace Words**\n\nHar line par `purana | naya` bhejo. Ye caption, text aur filename — teeno par lagega.\n"
             "Jaise:\n`x265 | x264`\n`1080p | 720p`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_remove":
         SETTING_STATES[uid] = {"action": "set_remove"}
         await query.message.reply_text(
-            "ðŸ§¹ **Remove Words**\n\nComma se alag karke words bhejo, jo caption, text aur filename se hatane hain.\n"
+            "🧹 **Remove Words**\n\nComma se alag karke words bhejo, jo caption, text aur filename se hatane hain.\n"
             "Jaise: `x265, PSA, 1080p`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_reset":
         reset_settings(uid)
-        await query.message.reply_text("â™»ï¸ Sab settings reset ho gayi!",
+        await query.message.reply_text("♻️ Sab settings reset ho gayi!",
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_login":
         await _cleanup_login(uid)
         LOGIN_STATES[uid] = {"step": "PHONE"}
         await query.message.reply_text(
-            "**ðŸ“± SECURE LOGIN**\n"
-            "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-            "**STEP 1/3 â€” Phone Number**\n\n"
-            "**ðŸ“ž Apna phone number bhejein**\n"
+            "**📱 SECURE LOGIN**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 1/3 — Phone Number**\n\n"
+            "**📞 Apna phone number bhejein**\n"
             "**country code ke saath**\n"
             "**Example:** `+919876543210`",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_logout":
         await _cleanup_login(uid)
         await _logout_user(uid)
-        await query.message.reply_text("ðŸ‘‹ Logout ho gaya. `/login` se dobara login karo.")
+        await query.message.reply_text("👋 Logout ho gaya. `/login` se dobara login karo.")
     elif data == "st_thumb":
         SETTING_STATES[uid] = {"action": "set_thumb"}
         await query.message.reply_text(
-            "ðŸ–¼ï¸ **Set Thumbnail**\n\nThumbnail ke liye ek **photo** bhejo.",
+            "🖼️ **Set Thumbnail**\n\nThumbnail ke liye ek **photo** bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_unthumb":
         update_setting(uid, "thumb_file_id", None)
-        await query.message.reply_text("âœ… Thumbnail hata diya.",
+        await query.message.reply_text("✅ Thumbnail hata diya.",
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_pdfwm":
         SETTING_STATES[uid] = {"action": "set_pdfwm"}
         await query.message.reply_text(
-            "ðŸ“„ **PDF Watermark**\n\nWatermark text bhejo (PDF ke har page par tircha lagega).\n"
+            "📄 **PDF Watermark**\n\nWatermark text bhejo (PDF ke har page par tircha lagega).\n"
             "Hatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_videowm":
         SETTING_STATES[uid] = {"action": "set_videowm"}
         await query.message.reply_text(
-            "ðŸŽ¬ **Video Watermark**\n\nWatermark text bhejo (video par likha aayega).\n"
-            "âš ï¸ Note: video dobara encode hogi, isliye **slow** hoga.\n"
+            "🎬 **Video Watermark**\n\nWatermark text bhejo (video par likha aayega).\n"
+            "⚠️ Note: video dobara encode hogi, isliye **slow** hoga.\n"
             "Hatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_uploadmethod":
         s = get_settings(uid)
         update_setting(uid, "upload_as_doc", not s["upload_as_doc"])
         mode = "Document" if not s["upload_as_doc"] else "Auto"
-        await query.message.reply_text(f"âœ… Upload method: **{mode}**",
+        await query.message.reply_text(f"✅ Upload method: **{mode}**",
                                        parse_mode=enums.ParseMode.MARKDOWN,
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_report":
         SETTING_STATES[uid] = {"action": "report"}
         await query.message.reply_text(
-            "ðŸž **Report Errors**\n\nKya problem aayi? Detail me likh ke bhejo, owner tak pahuncha dunga.",
+            "🐞 **Report Errors**\n\nKya problem aayi? Detail me likh ke bhejo, owner tak pahuncha dunga.",
             parse_mode=enums.ParseMode.MARKDOWN)
 
 
@@ -2908,33 +2926,33 @@ async def handle_setting_input(client, message):
     if action == "set_chat_id":
         if text.lower() == "off":
             update_setting(uid, "chat_id", None)
-            await done("âœ… **Chat ID hata diya. Files ab tumhe milengi.**")
+            await done("✅ **Chat ID hata diya. Files ab tumhe milengi.**")
             return
         try:
             cid = int(text)
         except ValueError:
-            await message.reply_text("âŒ Sahi ID bhejo, jaise `-1001234567890`.")
+            await message.reply_text("❌ Sahi ID bhejo, jaise `-1001234567890`.")
             return
         update_setting(uid, "chat_id", cid)
-        await done(f"âœ… **Chat ID set: `{cid}`**\n**Ab files wahi bheji jayengi.**")
+        await done(f"✅ **Chat ID set: `{cid}`**\n**Ab files wahi bheji jayengi.**")
     elif action == "set_rename":
         if text.lower() == "off":
             update_setting(uid, "rename_tag", None)
-            await done("âœ… **Rename tag hata diya.**")
+            await done("✅ **Rename tag hata diya.**")
         else:
             update_setting(uid, "rename_tag", text[:40])
-            await done(f"âœ… **Tag set: `[{text[:40]}]`**")
+            await done(f"✅ **Tag set: `[{text[:40]}]`**")
     elif action == "set_caption":
         if text.lower() == "off":
             update_setting(uid, "caption", None)
-            await done("âœ… **Caption hata diya.**")
+            await done("✅ **Caption hata diya.**")
         else:
             update_setting(uid, "caption", text[:500])
-            await done("âœ… **Caption set ho gaya.**")
+            await done("✅ **Caption set ho gaya.**")
     elif action == "set_replace":
         if text.lower() == "off":
             update_setting(uid, "replace_words", [])
-            await done("âœ… **Replace rules hata diye.**")
+            await done("✅ **Replace rules hata diye.**")
         else:
             pairs = []
             for line in text.split("\n"):
@@ -2944,41 +2962,41 @@ async def handle_setting_input(client, message):
                     if old:
                         pairs.append([old, new])
             update_setting(uid, "replace_words", pairs)
-            await done(f"âœ… **`{len(pairs)}` replace rules set.**")
+            await done(f"✅ **`{len(pairs)}` replace rules set.**")
     elif action == "set_remove":
         if text.lower() == "off":
             update_setting(uid, "remove_words", [])
-            await done("âœ… **Remove words hata diye.**")
+            await done("✅ **Remove words hata diye.**")
         else:
             words = [w.strip() for w in text.split(",") if w.strip()]
             update_setting(uid, "remove_words", words)
-            await done(f"âœ… **`{len(words)}` words hatane ke liye set.**")
+            await done(f"✅ **`{len(words)}` words hatane ke liye set.**")
     elif action == "set_pdfwm":
         if text.lower() == "off":
             update_setting(uid, "pdf_wm", None)
-            await done("âœ… **PDF watermark hata diya.**")
+            await done("✅ **PDF watermark hata diya.**")
         else:
             update_setting(uid, "pdf_wm", text[:60])
-            await done(f"âœ… **PDF watermark set: `{text[:60]}`**")
+            await done(f"✅ **PDF watermark set: `{text[:60]}`**")
     elif action == "set_videowm":
         if text.lower() == "off":
             update_setting(uid, "video_wm", None)
-            await done("âœ… **Video watermark hata diya.**")
+            await done("✅ **Video watermark hata diya.**")
         else:
             update_setting(uid, "video_wm", text[:40])
-            await done(f"âœ… **Video watermark set: `{text[:40]}`**\nâš ï¸ **Video slow encode hogi.**")
+            await done(f"✅ **Video watermark set: `{text[:40]}`**\n⚠️ **Video slow encode hogi.**")
     elif action == "report":
         if OWNER_ID:
             try:
                 await client.send_message(
                     OWNER_ID,
-                    f"ðŸž **Error report** from `{uid}`:\n\n{text[:1000]}",
+                    f"🐞 **Error report** from `{uid}`:\n\n{text[:1000]}",
                     parse_mode=enums.ParseMode.MARKDOWN)
-                await done("âœ… **Report owner ko bhej diya.**")
+                await done("✅ **Report owner ko bhej diya.**")
             except Exception:
-                await done("âŒ **Report nahi bheja ja saka.**")
+                await done("❌ **Report nahi bheja ja saka.**")
         else:
-            await done("âŒ **Owner set nahi hai.**")
+            await done("❌ **Owner set nahi hai.**")
 
 
 @app.on_message(filters.photo & filters.private)
@@ -2989,12 +3007,12 @@ async def thumb_photo_handler(client, message):
         return
     if not _is_allowed(uid):
         SETTING_STATES.pop(uid, None)
-        await message.reply_text("â›” Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
     SETTING_STATES.pop(uid, None)
     file_id = message.photo[-1].file_id
     update_setting(uid, "thumb_file_id", file_id)
-    await message.reply_text("âœ… Thumbnail set ho gaya!",
+    await message.reply_text("✅ Thumbnail set ho gaya!",
                              reply_markup=settings_keyboard(uid))
 
 
@@ -3011,7 +3029,7 @@ async def message_dispatcher(client, message):
     text = message.text.strip()
 
     # v40: Force-join gate direct links par bhi (pehle sirf /start, /batch,
-    # /login par tha â€” seedha link bhej kar bypass ho jata tha). Cached hai,
+    # /login par tha — seedha link bhej kar bypass ho jata tha). Cached hai,
     # isliye har message par API call nahi jaati.
     if not await _has_joined(user_id):
         await _send_join_wall(message)
@@ -3021,7 +3039,7 @@ async def message_dispatcher(client, message):
     if user_id in LOGIN_STATES:
         if not _is_allowed(user_id):
             await _cleanup_login(user_id)
-            await message.reply_text("â›” Tumhe is bot ki permission nahi hai.")
+            await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
             return
         await handle_login_step(client, message)
         return
@@ -3029,7 +3047,7 @@ async def message_dispatcher(client, message):
     # Permission gate: sirf allowed users
     if not _is_allowed(user_id):
         await message.reply_text(
-            "â›” Tumhe is bot ko use karne ki permission nahi hai.\nOwner se contact karo."
+            "⛔ Tumhe is bot ko use karne ki permission nahi hai.\nOwner se contact karo."
         )
         return
 
@@ -3044,7 +3062,7 @@ async def message_dispatcher(client, message):
     ):
         chat_id, start_id = parse_tg_link(text)
         if not chat_id or not start_id:
-            await message.reply_text("âŒ **Invalid link!** Sahi channel link bhejiye.")
+            await message.reply_text("❌ **Invalid link!** Sahi channel link bhejiye.")
             return
 
         USER_STATES[user_id] = {
@@ -3053,14 +3071,14 @@ async def message_dispatcher(client, message):
             "start_id": start_id,
         }
         await message.reply_text(
-            "**ðŸ”— VILLAN BATCH SYSTEM**\n"
-            "**â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”**\n"
-            "**STEP 2/2 â€” Range Complete**\n\n"
-            f"**âœ… Start Locked:** `{start_id}`\n\n"
-            "**ðŸ“Ž Ab aakhiri (last) message ka**\n"
+            "**🔗 VILLAN BATCH SYSTEM**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 2/2 — Range Complete**\n\n"
+            f"**✅ Start Locked:** `{start_id}`\n\n"
+            "**📎 Ab aakhiri (last) message ka**\n"
             "**link bhejein jahan tak**\n"
             "**extraction karna hai.**\n\n"
-            "**âŒ Cancel:** `/cancel`",
+            "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -3071,12 +3089,12 @@ async def message_dispatcher(client, message):
     ):
         chat_id, end_id = parse_tg_link(text)
         if not chat_id or not end_id:
-            await message.reply_text("âŒ **Invalid link!** Sahi channel link bhejiye.")
+            await message.reply_text("❌ **Invalid link!** Sahi channel link bhejiye.")
             return
 
         state = USER_STATES.pop(user_id)
         if state["chat_id"] != chat_id:
-            await message.reply_text("âŒ Links ek hi channel ke hone chahiye.")
+            await message.reply_text("❌ Links ek hi channel ke hone chahiye.")
             return
 
         start_id = state["start_id"]
@@ -3085,11 +3103,11 @@ async def message_dispatcher(client, message):
 
         total_files = end_id - start_id + 1
         if total_files > BATCH_LIMIT:
-            await message.reply_text(f"âš ï¸ Max {BATCH_LIMIT} posts allow hain.")
+            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
             return
 
         status_msg = await message.reply_text(
-            f"ðŸ¦… **Batch Started!** `{total_files}` items queued (ek-ek karke)."
+            f"🦅 **Batch Started!** `{total_files}` items queued (ek-ek karke)."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
         return
@@ -3108,11 +3126,11 @@ async def message_dispatcher(client, message):
 
         total = end_id - start_id + 1
         if total > BATCH_LIMIT:
-            await message.reply_text(f"âš ï¸ Max {BATCH_LIMIT} posts allow hain.")
+            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
             return
 
         status_msg = await message.reply_text(
-            f"â³ `{total}` item(s) processing (ek-ek karke)..."
+            f"⏳ `{total}` item(s) processing (ek-ek karke)..."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
 
@@ -3121,7 +3139,7 @@ async def message_dispatcher(client, message):
 async def main():
     await start_web_server()
 
-    print("ðŸš€ Starting Bot Client...", flush=True)
+    print("🚀 Starting Bot Client...", flush=True)
     await app.start()
 
     me = await app.get_me()
@@ -3137,29 +3155,29 @@ async def main():
             BotCommand("help", "Usage guide"),
             BotCommand("cancel", "Chal raha task roko"),
         ])
-        print("ðŸ‘‰ Bot command menu set ho gaya", flush=True)
+        print("👉 Bot command menu set ho gaya", flush=True)
     except Exception as e:
         print(f"[MENU] set_bot_commands fail: {e}", flush=True)
     print("========================================", flush=True)
-    print(f"ðŸ‘‰ BOT LISTENING AS: @{me.username}", flush=True)
-    print(f"ðŸ‘‰ VERSION: {VERSION}", flush=True)
-    print("ðŸ‘‰ MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
-    print(f"ðŸ‘‰ OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
-    print(f"ðŸ‘‰ PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s "
+    print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
+    print(f"👉 VERSION: {VERSION}", flush=True)
+    print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
+    print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
+    print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s "
           f"FETCH_CHUNK={FETCH_CHUNK}", flush=True)
-    print(f"ðŸ‘‰ MULTI_DL: {MULTI_PARTS} parts/file (ek file ke parts parallel, order sequential)", flush=True)
+    print(f"👉 MULTI_DL: {MULTI_PARTS} parts/file (ek file ke parts parallel, order sequential)", flush=True)
     if not OWNER_ID and SESSION_STRING:
-        print("âš ï¸ OWNER_ID set nahi hai â€” owner userbot fallback BAND hai "
+        print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
               "ID @userinfobot se leke OWNER_ID me set karo.", flush=True)
     print("========================================", flush=True)
 
     # Redeploy-proof data: backup channel se missing JSON wapas lao
     if BACKUP_CHAT_ID:
-        print(f"ðŸ‘‰ BACKUP_CHAT_ID: {BACKUP_CHAT_ID} (redeploy-proof backup ON)", flush=True)
+        print(f"👉 BACKUP_CHAT_ID: {BACKUP_CHAT_ID} (redeploy-proof backup ON)", flush=True)
         await _backup_restore_all()
     else:
-        print("ðŸ‘‰ BACKUP_CHAT_ID: not set (bina volume ke redeploy par data udega)", flush=True)
+        print("👉 BACKUP_CHAT_ID: not set (bina volume ke redeploy par data udega)", flush=True)
 
     await idle()
     await app.stop()
