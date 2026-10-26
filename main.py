@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v46"
+VERSION = "v47"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -778,6 +778,7 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
         return file_path
     except Exception as e:
         print(f"Download error on {msg_id}: {e}", flush=True)
+        info["download_error"] = str(e)  # v47: wrapper isko dekh kar refetch karega
         return None
 
 
@@ -790,7 +791,12 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
 # round-trip wait), isliye concurrent parts se throughput kai guna badh
 # sakta hai. Koi bhi error -> classic download (fallback), to worst case
 # v40 jitni speed, kabhi file fail nahi hoti is wajah se.
-MULTI_PARTS = max(1, min(8, int(os.environ.get("MULTI_PARTS", "6"))))
+# v47 FLOOD: default 6 -> 3. 6 parts ek saath GetFile bhejte the, to
+# Telegram us session par jaldi rate-limit lagata tha (15-16s Waiting
+# waves). 3 parts se burst aadha, throttle kam trigger hota hai; peak
+# speed thodi kam, par batch zyada steady chalta hai. Env se wapas
+# 6 kar sakte ho (MULTI_PARTS=6), par flood wale session par 3 hi rakho.
+MULTI_PARTS = max(1, min(8, int(os.environ.get("MULTI_PARTS", "3"))))
 MULTI_MIN_SIZE = int(os.environ.get("MULTI_MIN_SIZE", str(10 * 1024 * 1024)))
 MULTI_CHUNK = 1024 * 1024  # 1MB parts (Pyrogram ke get_file jaisa)
 
@@ -942,41 +948,95 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
         raise
 
 
+async def _refresh_info(user_client, info):
+    """v47 FLOOD/EXPIRED: stale file reference ko fresh karo.
+    Batch chunk me 100 messages ka metadata ek saath fetch hota hai; throttling
+    ki wajah se kisi file ka download ghanton baad shuru ho to uska reference
+    expire ho jata hai (2026-10-26 logs: 03:10 FILE_REFERENCE_EXPIRED x2).
+    Is case me usi message ko dobara fetch karo — naye reference ke saath —
+    aur info ke download fields update karo. Returns True/False."""
+    old = info.get("target_msg")
+    if not user_client or not old:
+        return False
+    chat = getattr(getattr(old, "chat", None), "id", None) or getattr(old, "chat", None)
+    if not chat:
+        return False
+    try:
+        fresh = await _fetch_with_warmup(user_client, chat, info["msg_id"])
+    except Exception as e:
+        print(f"[REFETCH] fail ({info['msg_id']}): {e}", flush=True)
+        return False
+    if not fresh or getattr(fresh, "empty", False):
+        return False
+    new = _info_from_msg(fresh, info["msg_id"])
+    if not isinstance(new, dict) or new.get("kind") in ("text", "too_big"):
+        return False
+    for k in ("file_id", "file_size", "file_name", "caption", "target_msg"):
+        if k in new:
+            info[k] = new[k]
+    info["file_path"] = None
+    info["tmpdir"] = None
+    info["download_error"] = None
+    print(f"[REFETCH] OK ({info['msg_id']}): fresh reference mil gaya",
+          flush=True)
+    return True
+
+
 async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
     """v41 wrapper: pehle multi-connection download try karo, fail par classic.
-    File order abhi bhi sequential hai — sirf ek file ke parts parallel aate hain."""
+    File order abhi bhi sequential hai — sirf ek file ke parts parallel aate hain.
+    v47: agar download FILE_REFERENCE_EXPIRED se fail ho, to ek baar fresh
+    reference lekar retry karo (purane reference par dobara try karna bekaar
+    hai — multi aur classic dono wahi stale reference use karte the)."""
     msg_id = info.get("msg_id")
-    if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
-            and info.get("file_id")
-            and (info.get("file_size", 0) or 0) >= MULTI_MIN_SIZE):
-        try:
-            dl_path = await _download_multi(
-                user_client, info, prog_msg, stats, uid, bot_client)
-            # classic jaisa tail: photo extension fix + video thumb
-            if info.get("kind") == "photo" and not dl_path.lower().endswith(
-                    (".jpg", ".jpeg", ".png", ".webp")):
-                try:
-                    os.rename(dl_path, dl_path + ".jpg")
-                    dl_path = dl_path + ".jpg"
-                except Exception:
-                    pass
-            info["file_path"] = dl_path
-            target_msg = info.get("target_msg")
-            if target_msg and target_msg.video and target_msg.video.thumbs:
-                try:
-                    info["thumb_path"] = await user_client.download_media(
-                        target_msg.video.thumbs[0].file_id,
-                        file_name=os.path.join(info["tmpdir"], "thumb.jpg"))
-                except Exception:
-                    info["thumb_path"] = None
-            print(f"Multi download OK ({msg_id}): {info.get('file_size', 0)} "
-                  f"bytes, {MULTI_PARTS} parts/file", flush=True)
-            return dl_path
-        except Exception as e:
-            print(f"Multi download fail ({msg_id}), classic par ja raha: {e}",
-                  flush=True)
-    return await download_file_classic(
-        user_client, info, prog_msg, stats, uid, bot_client)
+
+    async def _attempt():
+        if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
+                and info.get("file_id")
+                and (info.get("file_size", 0) or 0) >= MULTI_MIN_SIZE):
+            try:
+                dl_path = await _download_multi(
+                    user_client, info, prog_msg, stats, uid, bot_client)
+                # classic jaisa tail: photo extension fix + video thumb
+                if info.get("kind") == "photo" and not dl_path.lower().endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")):
+                    try:
+                        os.rename(dl_path, dl_path + ".jpg")
+                        dl_path = dl_path + ".jpg"
+                    except Exception:
+                        pass
+                info["file_path"] = dl_path
+                target_msg = info.get("target_msg")
+                if target_msg and target_msg.video and target_msg.video.thumbs:
+                    try:
+                        info["thumb_path"] = await user_client.download_media(
+                            target_msg.video.thumbs[0].file_id,
+                            file_name=os.path.join(info["tmpdir"], "thumb.jpg"))
+                    except Exception:
+                        info["thumb_path"] = None
+                print(f"Multi download OK ({msg_id}): {info.get('file_size', 0)} "
+                      f"bytes, {MULTI_PARTS} parts/file", flush=True)
+                return dl_path
+            except Exception as e:
+                info["download_error"] = str(e)  # v47: expired check ke liye
+                print(f"Multi download fail ({msg_id}), classic par ja raha: {e}",
+                      flush=True)
+        return await download_file_classic(
+            user_client, info, prog_msg, stats, uid, bot_client)
+
+    result = await _attempt()
+    if result:
+        return result
+    # v47: sirf expired-reference case me ek baar fresh fetch + retry.
+    # Baaki failures (network, FloodWait, deleted msg) par dobara try nahi —
+    # wo file normal fail count hogi, batch aage badhega.
+    if "FILE_REFERENCE_EXPIRED" not in (info.get("download_error") or ""):
+        return result
+    print(f"[REFETCH] stale reference ({msg_id}), fresh fetch karke retry",
+          flush=True)
+    if not await _refresh_info(user_client, info):
+        return result
+    return await _attempt()
 
 
 def _needs_file(s, info):
