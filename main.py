@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v47"
+VERSION = "v48"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -1970,6 +1970,280 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
 
 
 
+
+# --- v48 CLONE: private group ke folders (topics) ko naye private group me copy ---
+# User ne manga: har baar bot me group link do, naya group PRIVATE ho, aur
+# jo kuch source me hai sab nikalna hai (media + text, sab folders).
+# Design (Pyrogram 2.0.106 source se verify kiya hua):
+# - Group create BOT se nahi hota, sirf user account (userbot, /login session)
+#   se hota hai -> naye group ka owner wahi account hoga jisne /clone chalaya.
+# - Topics ki list BOT se nahi milti (BOT_METHOD_INVALID), userbot se milti hai
+#   (channels.GetForumTopics, ForumTopic.id = topic id, .title = folder naam).
+# - Topic ke messages ki pehchan: Message.reply_to_top_message_id (None/1 = General).
+# - Copy download+upload se hoti hai (private source par file_id fast path nahi
+#   chalta) -> files same (naam/caption/order same), par message ID/time naye.
+# - Naya group forum + private banega (CreateChannel megagroup=True, forum=True,
+#   koi username set nahi -> private). Topics userbot se banenge
+#   (channels.CreateForumTopic, user account ko ye allowed hai).
+CLONE_STATES = {}  # uid -> {"step": "WAITING_LINK"}
+CLONE_ACTIVE = {}  # uid -> asyncio.Event (cancel flag, /cancel se set hota hai)
+
+
+def _clone_parse_link(text):
+    """Clone ke liye group link parse karo. Message ID zaroori nahi — poora
+    group chahiye, isliye sirf chat pehchano. Returns chat_id (int/str) ya None."""
+    import re as _re
+    m = _re.search(r"t\.me/c/(\d+)", text or "")
+    if m:
+        return int(f"-100{m.group(1)}")
+    m = _re.search(r"t\.me/([a-zA-Z0-9_]+)", text or "")
+    if m:
+        return m.group(1)
+    m = _re.search(r"^@([a-zA-Z0-9_]+)$", (text or "").strip())
+    if m:
+        return m.group(1)
+    return None
+
+
+def _clone_topic_key(msg):
+    """Message kis folder (topic) ka hai: reply_to_top_message_id, warna General (1)."""
+    key = getattr(msg, "reply_to_top_message_id", None)
+    return key if key else 1
+
+
+async def _clone_list_topics(userbot, src_chat):
+    """Source ke saare forum topics lao, pagination ke saath.
+    Returns [(topic_id, title), ...] ya None (forum nahi hai / access nahi)."""
+    from pyrogram import raw
+    peer = await userbot.resolve_peer(src_chat)
+    topics = []
+    offset_date, offset_id, offset_topic = 0, 0, 0
+    for _page in range(10):  # max 1000 topics, usse zyada ka group rare hai
+        res = await userbot.invoke(raw.functions.channels.GetForumTopics(
+            channel=peer, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=100))
+        batch = [(t.id, t.title) for t in res.topics]
+        if not batch:
+            break
+        topics.extend(batch)
+        if len(batch) < 100:
+            break
+        last = res.topics[-1]
+        offset_date, offset_id, offset_topic = last.date, last.top_message, last.id
+    return topics
+
+
+async def _clone_create_group(userbot, title):
+    """Naya PRIVATE forum group banao (user account se). Returns dest_chat_id ya None."""
+    from pyrogram import raw
+    title = (title or "Clone")[:120]
+    upd = await userbot.invoke(raw.functions.channels.CreateChannel(
+        title=title, about="Cloned by VILLAN bot", megagroup=True, forum=True))
+    for ch in getattr(upd, "chats", []) or []:
+        cid = getattr(ch, "id", None)
+        if cid:
+            return int(f"-100{cid}")
+    return None
+
+
+async def _clone_create_topic(userbot, dest_chat_id, title):
+    """Naye group me ek folder (topic) banao. Returns dest topic_id ya None.
+    Pehle CreateForumTopic ke result se id nikalo, na mile to list se dhoondho."""
+    from pyrogram import raw
+    import random as _rand
+    peer = await userbot.resolve_peer(dest_chat_id)
+    title = (title or "Folder")[:100]
+    try:
+        upd = await userbot.invoke(raw.functions.channels.CreateForumTopic(
+            channel=peer, title=title,
+            random_id=_rand.randint(1, 2**63 - 1)))
+        _candidates = []
+        for _u in (getattr(upd, "updates", []) or []):
+            _candidates.append(getattr(_u, "message", _u))
+        for _m in (getattr(upd, "messages", []) or []):
+            _candidates.append(_m)
+        for msg in _candidates:
+            act = getattr(msg, "action", None)
+            if act and type(act).__name__ == "MessageActionForumTopicCreated":
+                return msg.id
+    except Exception as e:
+        print(f"[CLONE] topic create fail '{title}': {e}", flush=True)
+    # Fallback: list me se title se dhoondho
+    try:
+        for tid, ttitle in await _clone_list_topics(userbot, dest_chat_id):
+            if ttitle == title:
+                return tid
+    except Exception:
+        pass
+    return None
+
+
+async def _clone_send_text(userbot, dest_peer, topic_id, text):
+    """Text message ko dest topic me bhejo (raw, top_msg_id ke saath)."""
+    from pyrogram import raw
+    import random as _rand
+    if not text:
+        return False
+    try:
+        await userbot.invoke(raw.functions.messages.SendMessage(
+            peer=dest_peer, message=text,
+            random_id=_rand.randint(1, 2**63 - 1), top_msg_id=topic_id))
+        return True
+    except Exception as e:
+        print(f"[CLONE] text send fail: {e}", flush=True)
+        return False
+
+
+async def run_clone(client, uid, src_chat, status_msg):
+    """Poora clone: topics nikalo -> naya private group -> same folders ->
+    har folder ki saari messages (oldest-first) copy karo. Sequential, ek-ek karke."""
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — naya group tumhare "
+                            "account se banega, isliye login session zaroori hai.")
+        return
+    cancel_event = asyncio.Event()
+    CLONE_ACTIVE[uid] = cancel_event
+    try:
+        try:
+            src = await userbot.get_chat(src_chat)
+            src_title = getattr(src, "title", None) or str(src_chat)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Source group nahi khul raha: {e}\n"
+                                "Check karo ki tumhara account us group ka member hai.")
+            return
+        await safe_edit(status_msg, f"🔍 **Clone shuru:** `{src_title}`\nFolders nikal raha hun...")
+        try:
+            topics = await _clone_list_topics(userbot, src_chat)
+        except Exception as e:
+            print(f"[CLONE] list topics fail (forum nahi?): {e}", flush=True)
+            topics = None
+        topic_titles = {tid: ttitle for tid, ttitle in (topics or [])}
+        # STEP 1: saari history ek baar me group karo (newest-first aati hai)
+        buckets = {}
+        try:
+            async for msg in userbot.get_chat_history(src_chat):
+                if cancel_event.is_set():
+                    break
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                buckets.setdefault(_clone_topic_key(msg), []).append(msg)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
+            return
+        total_msgs = sum(len(v) for v in buckets.values())
+        await safe_edit(status_msg, f"📂 **Folders mile:** `{len(topic_titles) if topics else 1}`\n"
+                        f"Messages: `{total_msgs}` — naya private group bana raha hun...")
+        # STEP 2: naya private group
+        try:
+            dest_id = await _clone_create_group(userbot, f"{src_title} Clone")
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Naya group nahi ban paya: {e}")
+            return
+        if not dest_id:
+            await message_reply(status_msg, "❌ Naya group nahi ban paya (koi id nahi mili).")
+            return
+        dest_peer = await userbot.resolve_peer(dest_id)
+        # STEP 3: same folders naye group me (General = 1, pehle se hota hai)
+        dest_map = {1: 1}
+        if topics:
+            for tid, ttitle in topics:
+                if tid == 1:
+                    continue
+                if cancel_event.is_set():
+                    break
+                new_tid = await _clone_create_topic(userbot, dest_id, ttitle)
+                if new_tid:
+                    dest_map[tid] = new_tid
+                else:
+                    print(f"[CLONE] folder fail, General me jayega: {ttitle}", flush=True)
+                    dest_map[tid] = 1
+        # STEP 4: har folder ki messages oldest-first copy karo
+        ordered = [1] + [tid for tid, _ in (topics or []) if tid != 1]
+        for k in buckets:
+            if k not in ordered:
+                ordered.append(k)
+        copied = failed = skipped = 0
+        for key in ordered:
+            msgs = buckets.get(key, [])
+            if not msgs:
+                continue
+            dest_tid = dest_map.get(key, 1)
+            fname = topic_titles.get(key, "General") if key != 1 else "General"
+            await safe_edit(status_msg, f"📂 **Folder:** `{fname}`\n"
+                            f"Copy ho raha hai... (total ab tak: ✅ {copied} | ❌ {failed})")
+            for m in reversed(msgs):  # oldest-first = same order
+                if cancel_event.is_set():
+                    break
+                if not m.media and not m.text:
+                    skipped += 1
+                    continue
+                info = _info_from_msg(m, m.id)
+                if info is None:
+                    skipped += 1
+                    continue
+                if info.get("kind") == "too_big":
+                    failed += 1
+                    continue
+                if info.get("kind") == "text":
+                    if await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]):
+                        copied += 1
+                    else:
+                        failed += 1
+                    continue
+                fp = await download_file(userbot, info, None, None, uid, client)
+                if not fp:
+                    failed += 1
+                    if info.get("tmpdir"):
+                        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                    continue
+                ok = await _raw_send_to_topic(
+                    userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
+                    caption=info.get("caption") or "", info=info)
+                if info.get("tmpdir"):
+                    shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                if ok:
+                    copied += 1
+                else:
+                    failed += 1
+                # Flood se bachne ke liye har media file ke baad chhota gap
+                await asyncio.sleep(2)
+            if cancel_event.is_set():
+                break
+        # Invite link (private group kholne ke liye)
+        invite = None
+        try:
+            from pyrogram import raw as _raw
+            inv = await userbot.invoke(_raw.functions.messages.ExportChatInvite(
+                peer=dest_peer))
+            invite = getattr(inv, "link", None)
+        except Exception as e:
+            print(f"[CLONE] invite link fail: {e}", flush=True)
+        done_text = ("✅ **Clone complete!**\n"
+                     f"📦 Naya group: `{src_title} Clone`\n"
+                     f"📂 Folders: `{len(topic_titles) if topics else 1}`\n"
+                     f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`")
+        if invite:
+            done_text += f"\n🔗 Invite: {invite}"
+        if cancel_event.is_set():
+            done_text = "🛑 **Clone stopped.**\n" + done_text
+        await safe_edit(status_msg, done_text)
+        await message_reply(status_msg, done_text)
+    finally:
+        CLONE_ACTIVE.pop(uid, None)
+
+
+async def message_reply(status_msg, text):
+    """Status message ke neeche ek naya message bhejo (edit fail-safe nahi)."""
+    try:
+        await status_msg.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+    except Exception:
+        try:
+            await status_msg.reply_text(text)
+        except Exception:
+            pass
+
+
 # --- v35: FORCE-JOIN + WELCOME PANELS (video wale reference bot jaisa) ---
 # v40: join-check ka result 5 min cache — har message par get_chat_member
 # call nahi hoti (kam requests = kam flood risk).
@@ -2132,6 +2406,7 @@ COMMANDS_TEXT = (
     "**• `/login` — Apne number se login**\n"
     "**• `/logout` — Session khatam karo**\n"
     "**• `/batch` — Bulk extraction (range)**\n"
+    "**• `/clone` — Group folders clone karo**\n"
     "**• `/settings` — Customize panel**\n"
     "**• `/plan` — Apna plan dekho**\n"
     "**• `/buy` — Premium kharido**\n"
@@ -2279,6 +2554,10 @@ async def cancel_handler(client, message):
         SETTING_STATES.pop(uid, None)
         hit = True
     ev = ACTIVE_BATCHES.get(uid)
+    if ev is not None:
+        ev.set()
+        hit = True
+    ev = CLONE_ACTIVE.get(uid)
     if ev is not None:
         ev.set()
         hit = True
@@ -2470,6 +2749,7 @@ async def batch_start_handler(client, message):
     # Purani adhuri setting-input state ho to hatao, warna batch ka link
     # galti se setting handler me chala jayega
     SETTING_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
         "**🔗 VILLAN BATCH SYSTEM**\n"
@@ -2477,6 +2757,30 @@ async def batch_start_handler(client, message):
         "**STEP 1/2 — Source Selection**\n\n"
         "**📎 Start message ka link bhejein**\n"
         "**jahan se extraction shuru karna hai.**\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("clone") & filters.private)
+async def clone_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        return
+    print(f"⚡ Processing /clone for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
+    CLONE_STATES[message.chat.id] = {"step": "WAITING_LINK"}
+    await message.reply_text(
+        "**📂 VILLAN GROUP CLONE**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**Source group ka link bhejo**\n"
+        "(jiske folders clone karne hain).\n\n"
+        "Naya **private** group tumhare account se banega,\n"
+        "usme wahi folders banenge, aur jo kuch hai\n"
+        "sab same-to-same copy hoga.\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -3116,6 +3420,20 @@ async def message_dispatcher(client, message):
         await handle_setting_input(client, message)
         return
 
+    # Clone flow: group link ka jawab aa raha ho (har baar bot me link manga jata hai)
+    if user_id in CLONE_STATES and CLONE_STATES[user_id].get("step") == "WAITING_LINK":
+        src_chat = _clone_parse_link(text)
+        if src_chat is None:
+            await message.reply_text("❌ **Invalid link!** Source group ka link bhejo "
+                                     "(jaise `https://t.me/c/1234567890` ya `@groupname`).")
+            return
+        CLONE_STATES.pop(user_id, None)
+        status_msg = await message.reply_text(
+            "📂 **Clone Started!** Folders aur messages nikal raha hun (ek-ek karke)..."
+        )
+        await run_clone(client, user_id, src_chat, status_msg)
+        return
+
     if (
         user_id in USER_STATES
         and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -3209,6 +3527,7 @@ async def main():
             BotCommand("login", "Apne number se login"),
             BotCommand("logout", "Session khatam karo"),
             BotCommand("batch", "Bulk extraction (range)"),
+            BotCommand("clone", "Group folders clone karo"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
             BotCommand("buy", "Premium kharido"),
