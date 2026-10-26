@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v48"
+VERSION = "v49"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -1430,7 +1430,7 @@ async def _direct_fast(client, dest_chat, group_id, topic_id, kind, file_id, cap
     return True
 
 
-async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None):
+async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None, fast_only=False):
     """Ek file deliver karo: personal (dest_chat) + group topic (LOG_GROUP_ID).
     FAST PATH: file_id se instant bhejo (no download/upload).
     SLOW PATH: download karo, settings lagao, phir upload karo.
@@ -1525,7 +1525,11 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         # file_id par bot ke send karne ki koshish hi bekar thi (MEDIA_EMPTY),
         # isliye private source par seedha download+upload chalta hai.
         file_id = info.get("file_id")
-        if (file_id and not _needs_file(s, info)
+        # v49 /public: file_id fast path tab bhi jab settings (remove/
+        # rename/watermark) lagi hon — caption ke rules upar _make_cap me
+        # lag chuke hain, isliye caption saaf milega; sirf filename
+        # rename/watermark/thumbnail skip honge (unhe download chahiye).
+        if (file_id and (fast_only or not _needs_file(s, info))
                 and (userbot is None or userbot is client)):
             ok = await _direct_fast(
                 client, dest_chat, group_id, topic_id,
@@ -1533,6 +1537,9 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             if ok:
                 info["delivered_fast"] = True
                 return True
+            if fast_only:
+                print(f"[PUBLIC] fast fail ({info['msg_id']}) — slow fallback",
+                      flush=True)
             print(f"Fast path failed ({info['msg_id']}) — downloading...",
                   flush=True)
 
@@ -1748,7 +1755,7 @@ def _drop_holder(holders, holder):
         pass
 
 
-async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
+async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, public_fast=False):
     # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
     # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
     # kiya gaya file_id BOT ka apna hota hai, isliye fast path (file_id
@@ -1800,7 +1807,9 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 needs_dl = (
                     fetch_client is not client   # private source: instant fail hoga hi
                     or not info.get("file_id")
-                    or _needs_file(s, info)      # settings lagani hain
+                    # v49 /public: settings ke liye bhi prefetch download MAT
+                    # karo — file file_id se instant jayegi, download bekar hai
+                    or (not public_fast and _needs_file(s, info))
                 )
                 if needs_dl:
                     try:
@@ -1919,7 +1928,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 # prog_msg = per-file progress (alag message), status_msg = pinned batch
                 ok_one = await upload_one(
                     client, fetch_client, owner_id, dest_chat, topic_id,
-                    status_msg, info, stats, prog_msg)
+                    status_msg, info, stats, prog_msg,
+                    fast_only=public_fast)
                 # Memory: inline-prepared file ka holder ab zaroorat nahi
                 if 'holder' in locals():
                     _drop_holder(holders, holder)
@@ -2406,6 +2416,7 @@ COMMANDS_TEXT = (
     "**• `/login` — Apne number se login**\n"
     "**• `/logout` — Session khatam karo**\n"
     "**• `/batch` — Bulk extraction (range)**\n"
+    "**• `/public` — Public channel fast copy**\n"
     "**• `/clone` — Group folders clone karo**\n"
     "**• `/settings` — Customize panel**\n"
     "**• `/plan` — Apna plan dekho**\n"
@@ -2546,6 +2557,9 @@ async def cancel_handler(client, message):
     hit = False
     if uid in USER_STATES:
         USER_STATES.pop(uid, None)
+        hit = True
+    if uid in PUBLIC_STATES:
+        PUBLIC_STATES.pop(uid, None)
         hit = True
     if uid in LOGIN_STATES:
         await _cleanup_login(uid)
@@ -2750,6 +2764,7 @@ async def batch_start_handler(client, message):
     # galti se setting handler me chala jayega
     SETTING_STATES.pop(message.chat.id, None)
     CLONE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
         "**🔗 VILLAN BATCH SYSTEM**\n"
@@ -2781,6 +2796,45 @@ async def clone_start_handler(client, message):
         "Naya **private** group tumhare account se banega,\n"
         "usme wahi folders banenge, aur jo kuch hai\n"
         "sab same-to-same copy hoga.\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+# --- v49 /public: PUBLIC channel ke liye alag FAST command ---
+# Wajah: /batch me remove/rename/watermark settings lagi hon to _needs_file
+# True ho jata hai aur public channel bhi download+upload (slow) ho jata
+# hai, jabki public ka file_id bot ke paas khud hota hai aur instant bheja
+# ja sakta hai. /public usi fast path ko force karta hai: prefetch download
+# band, file_id se instant delivery. Caption/text ke remove/replace rules
+# phir bhi lagenge (wo text-only hain); filename rename, watermark aur
+# thumbnail /public me nahi lagenge — unhe download chahiye hota hai, aur
+# wahi slow karta tha. Private link /public me mana hai (uske liye /batch).
+PUBLIC_STATES = {}  # uid -> {"step": "WAITING_FIRST_LINK"/"WAITING_LAST_LINK", ...}
+
+
+@app.on_message(filters.command("public") & filters.private)
+async def public_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        return
+    print(f"⚡ Processing /public for user {message.chat.id}", flush=True)
+    SETTING_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    USER_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
+    await message.reply_text(
+        "**⚡ VILLAN PUBLIC FAST**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**STEP 1/2 — Public channel ka start link bhejo**\n\n"
+        "Sirf **public** channel (jaise `t.me/channelname/123`) —\n"
+        "private link ke liye `/batch` use karo.\n\n"
+        "⚡ Files **file_id se instant** jayengi (download/upload nahi).\n"
+        "Caption ke remove/replace rules lagenge, par **filename\n"
+        "rename, watermark aur thumbnail is mode me nahi lagenge.**\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -3084,6 +3138,28 @@ def apply_text_rules(text, s):
     return out
 
 
+def _parse_remove_words(text):
+    """v49: Remove words ek saath kai — comma, space ya nayi line, kisi se
+    bhi alag karke bhejo. ('x265, PSA, 1080p' ya har line par ek word ya
+    space se alag words — teeno ek hi list banenge.) Duplicates hatake,
+    order wahi rahega, max 50 words."""
+    import re as _re
+    seen = set()
+    words = []
+    for w in _re.split(r"[\s,]+", text or ""):
+        w = w.strip()
+        if not w:
+            continue
+        key = w.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        words.append(w)
+        if len(words) >= 50:
+            break
+    return words
+
+
 def apply_filename_rules(filename, s):
     """remove_words -> replace_words -> rename_tag lagao (filename par).
     v43: matching case-insensitive — 'JOIN' bhi 'join' rule se hatega."""
@@ -3216,7 +3292,7 @@ async def settings_callbacks(client, query):
     elif data == "st_remove":
         SETTING_STATES[uid] = {"action": "set_remove"}
         await query.message.reply_text(
-            "🧹 **Remove Words**\n\nComma se alag karke words bhejo, jo caption, text aur filename se hatane hain.\n"
+            "🧹 **Remove Words**\n\nEk saath KAI words bhej sakte ho — comma, space ya har line par alag word, jo caption, text aur filename se hatane hain.\n"
             "Jaise: `x265, PSA, 1080p`\nHatane ke liye `off` bhejo.",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_reset":
@@ -3332,9 +3408,10 @@ async def handle_setting_input(client, message):
             update_setting(uid, "remove_words", [])
             await done("✅ **Remove words hata diye.**")
         else:
-            words = [w.strip() for w in text.split(",") if w.strip()]
+            words = _parse_remove_words(text)
             update_setting(uid, "remove_words", words)
-            await done(f"✅ **`{len(words)}` words hatane ke liye set.**")
+            shown = ", ".join(f"`{w}`" for w in words) if words else "koi nahi"
+            await done(f"✅ **`{len(words)}` words hatane ke liye set:** {shown}")
     elif action == "set_pdfwm":
         if text.lower() == "off":
             update_setting(uid, "pdf_wm", None)
@@ -3435,6 +3512,73 @@ async def message_dispatcher(client, message):
         return
 
     if (
+        user_id in PUBLIC_STATES
+        and PUBLIC_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
+    ):
+        chat_id, start_id = parse_tg_link(text)
+        if not chat_id or not start_id:
+            await message.reply_text("❌ **Invalid link!** Sahi public channel link bhejiye.")
+            return
+        if isinstance(chat_id, int):
+            # t.me/c/... = private link — /public sirf public ke liye hai
+            await message.reply_text(
+                "❌ **Ye private channel ka link hai!**\n"
+                "`/public` sirf public channel ke liye hai.\n"
+                "Private ke liye `/batch` use karo, ya public channel ka link bhejo.")
+            return
+
+        PUBLIC_STATES[user_id] = {
+            "step": "WAITING_LAST_LINK",
+            "chat_id": chat_id,
+            "start_id": start_id,
+        }
+        await message.reply_text(
+            "**⚡ VILLAN PUBLIC FAST**\n"
+            "**━━━━━━━━━━━━━━━**\n\n"
+            f"**✅ Start Locked:** `{start_id}`\n\n"
+            "**📎 Ab aakhiri (last) message ka**\n"
+            "**link bhejein jahan tak**\n"
+            "**fast copy karna hai.**\n\n"
+            "**❌ Cancel:** `/cancel`",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+        return
+
+    elif (
+        user_id in PUBLIC_STATES
+        and PUBLIC_STATES[user_id].get("step") == "WAITING_LAST_LINK"
+    ):
+        chat_id, end_id = parse_tg_link(text)
+        if not chat_id or not end_id:
+            await message.reply_text("❌ **Invalid link!** Sahi public channel link bhejiye.")
+            return
+        if isinstance(chat_id, int):
+            await message.reply_text(
+                "❌ **Ye private channel ka link hai!** `/public` sirf public ke liye hai.")
+            return
+
+        state = PUBLIC_STATES.pop(user_id)
+        if state["chat_id"] != chat_id:
+            await message.reply_text("❌ Links ek hi channel ke hone chahiye.")
+            return
+
+        start_id = state["start_id"]
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
+        total_files = end_id - start_id + 1
+        if total_files > BATCH_LIMIT:
+            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
+            return
+
+        status_msg = await message.reply_text(
+            f"⚡ **Public Fast Started!** `{total_files}` items (file_id instant)."
+        )
+        await run_batch(client, user_id, chat_id, start_id, end_id, status_msg,
+                        public_fast=True)
+        return
+
+    if (
         user_id in USER_STATES
         and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
     ):
@@ -3527,6 +3671,7 @@ async def main():
             BotCommand("login", "Apne number se login"),
             BotCommand("logout", "Session khatam karo"),
             BotCommand("batch", "Bulk extraction (range)"),
+            BotCommand("public", "Public channel fast copy"),
             BotCommand("clone", "Group folders clone karo"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
