@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v49"
+VERSION = "v50"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -85,6 +85,9 @@ BATCH_LIMIT = max(1, int(os.environ.get("BATCH_LIMIT", "1000")))
 # badal sakte hain. Bada gap = zyada safety, chhota = zyada speed.
 FAST_GAP = float(os.environ.get("FAST_GAP", "2"))
 SLOW_GAP = float(os.environ.get("SLOW_GAP", "3"))
+# v50 PRIVATE GAP: sirf private channel batch me 10s countdown gap.
+# Public (/public) par ye nahi lagta, wahan FAST/SLOW hi rehta hai.
+PRIVATE_GAP = float(os.environ.get("PRIVATE_GAP", "10"))
 # v40 SPEED: metadata ek hi get_messages call me itne messages ka aata hai
 # (pehle har message ke liye alag call thi — 100 files par 100 requests).
 # Max 200 (Telegram limit).
@@ -461,7 +464,7 @@ async def _update_batch_status(status_msg, stats, force=False):
     eta_s = int(remaining * per_file)
     eta_str = time_formatter(eta_s * 1000) if done > 0 else "—"
     text = (
-        "📦 **BATCH STATUS**\n"
+        "📦 **VILLAN BATCH**\n"
         f"{bar} `{pct:.0f}%`\n"
         "━━━━━━━━━━━━━━━\n"
         f"📁 Total: `{total}`\n"
@@ -1755,6 +1758,38 @@ def _drop_holder(holders, holder):
         pass
 
 
+def _source_link(src_chat, msg_id):
+    """v50: src_chat + msg_id se wapas original t.me link banao."""
+    if isinstance(src_chat, int):
+        s = str(src_chat)
+        core = s[4:] if s.startswith("-100") else s.lstrip("-")
+        return f"https://t.me/c/{core}/{msg_id}"
+    return f"https://t.me/{src_chat}/{msg_id}"
+
+
+async def _archive_source_link(client, topic_id, src_chat, start_id, end_id, owner_id):
+    """v50: batch ka source link user ke folder (log-group topic) me save karo.
+    Sirf topic me bhejte hain, user chat me nahi (wahan clutter nahi chahiye).
+    Topic na mile to batch nahi rukega, sirf log me likhenge."""
+    if not topic_id:
+        print("[SOURCE] skip: no topic", flush=True)
+        return False
+    total = end_id - start_id + 1
+    record = (
+        f"📌 SOURCE\n"
+        f"First: {_source_link(src_chat, start_id)}\n"
+        f"Last: {_source_link(src_chat, end_id)}\n"
+        f"Range: {start_id}–{end_id} • Total: {total}"
+    )
+    try:
+        ok = await _botapi_send_to_topic("text", caption=record, topic_id=topic_id)
+        print(f"[SOURCE] archived: {ok}", flush=True)
+        return bool(ok)
+    except Exception as e:
+        print(f"[SOURCE] failed: {e}", flush=True)
+        return False
+
+
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, public_fast=False):
     # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
     # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
@@ -1768,9 +1803,9 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     elif not userbot:
         await client.send_message(
             owner_id,
-            "❌ **Pehle /login karke apne number se login karo.**",
+            "❌ Login required. Use /login first.",
         )
-        await safe_edit(status_msg, "❌ **Login required. Pehle /login karo.**")
+        await safe_edit(status_msg, "❌ Login required.")
         return
     else:
         fetch_client = userbot
@@ -1784,13 +1819,12 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     dest_chat = get_settings(owner_id)["chat_id"] or owner_id
     # Log group me user ke naam ka folder (topic) banao
     topic_id = await get_or_create_topic(userbot, owner_id)
+    # v50: user ne jo link diya, wo uske folder me record ho jaye
+    await _archive_source_link(client, topic_id, src_chat, start_id, end_id, owner_id)
     peer_msg = (
-        "❌ **Channel/group nahi mila.**\n"
-        "Tumhara logged-in account is channel ka **member nahi hai**, "
-        "ya link galat hai.\n"
-        "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
-        "• Link bilkul usi channel ka hona chahiye\n"
-        "Phir dobara try karo."
+        "❌ Channel not found.\n"
+        "• Join it with the logged-in account\n"
+        "• Check the link and try again."
     )
 
     # v44 PIPELINE: is file ka metadata + (zaroorat ho to) download. Jab ye
@@ -1844,7 +1878,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
             if fetched == "BREAK":
                 await client.send_message(
                     owner_id,
-                    "❌ **Error:** Userbot us private channel ka member nahi hai.",
+                    "❌ Account is not a member of this private channel.",
                 )
                 cancel_event.set()
                 break
@@ -1885,7 +1919,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                 if info == "BREAK":
                     await client.send_message(
                         owner_id,
-                        "❌ **Error:** Userbot us private channel ka member nahi hai.",
+                        "❌ Account is not a member of this private channel.",
                     )
                     cancel_event.set()
                     break
@@ -1904,7 +1938,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         pass
                 try:
                     prog_msg = await client.send_message(
-                        owner_id, "⏳ **Taiyaar...**",
+                        owner_id, "⏳ Preparing…",
                         parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception:
                     prog_msg = None
@@ -1941,15 +1975,29 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         stats.fail += 1
                 # Pinned status live update (max 3 sec me 1 baar)
                 await _update_batch_status(status_msg, stats)
-                # FLOOD PACING: instant delivery (public file_id) ke baad chhota
-                # gap (FAST_GAP), slow delivery (download+upload) ke baad bada
-                # gap (SLOW_GAP). Is gap me background download chalta rehta
-                # hai, isliye ye wait bhi waste nahi hota.
+                # v50 PACING: PRIVATE batch me 10s countdown gap, PUBLIC par nahi.
+                # Countdown per-file progress message par dikhta hai (10..1).
+                # Pinned status ko har second edit nahi karte (edit-flood se bachne).
                 if mid != ids[-1]:
-                    gap = FAST_GAP if (
-                        isinstance(info, dict) and info.get("delivered_fast")
-                    ) else SLOW_GAP
-                    await asyncio.sleep(gap)
+                    if not is_public and not public_fast:
+                        _kind = info.get("kind") if isinstance(info, dict) else None
+                        if _kind == "text":
+                            await asyncio.sleep(FAST_GAP)
+                        else:
+                            print(f"[WAIT] Private gap {int(PRIVATE_GAP)}s before next file", flush=True)
+                            _left = int(PRIVATE_GAP)
+                            while _left > 0:
+                                if cancel_event.is_set():
+                                    break
+                                if prog_msg is not None:
+                                    await safe_edit(prog_msg, f"⏳ Next file in {_left}s")
+                                await asyncio.sleep(1)
+                                _left -= 1
+                    else:
+                        gap = FAST_GAP if (
+                            isinstance(info, dict) and info.get("delivered_fast")
+                        ) else SLOW_GAP
+                        await asyncio.sleep(gap)
             i += len(chunk)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
@@ -1971,11 +2019,11 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
     if cancel_event.is_set() and (done < total):
-        await safe_edit(status_msg, "🛑 **Batch stopped.**")
+        await safe_edit(status_msg, "🛑 Batch stopped.")
     else:
         await safe_edit(
             status_msg,
-            f"✅ **Batch complete!**\n✔️ Success: `{ok}` | ❌ Failed: `{fail}`",
+            f"✅ Batch complete\nSuccess: `{ok}` | Failed: `{fail}`",
         )
 
 
@@ -2372,24 +2420,20 @@ async def _send_join_wall(message):
 
 def _welcome_text(uid):
     has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
-    login = "🟢 Logged in" if has_session else "🔴 Not logged in (/login karo)"
+    login = "🟢 Logged in" if has_session else "🔴 Not logged in — /login"
     access = "✅ Allowed" if _is_allowed(uid) else "⛔ Not allowed"
     return (
-        "**🚀 Welcome to VILLAN Restriction Bot 🦅**\n\n"
-        "**🌟 *Private/Restricted content save karne ka sabse fast tareeka***\n\n"
-        "**📌 Key Features:**\n"
-        "**- 🛡️ Restriction Bypass — save-restricted videos/files nikalo**\n"
-        "**- ⚡ File-ID Fast Path — supported files bilkul instant**\n"
-        "**- 📦 Bulk Batch — ek saath 1000 tak links**\n"
-        "**- 🔄 Public + Private — dono tarah ke channels**\n"
-        "**- 🎛️ Full Customize — rename, caption, watermark, thumbnail**\n\n"
-        "**🎯 Perfect For:**\n"
-        "**- Course / content collectors 📚**\n"
-        "**- Channel admins 🔄**\n"
-        "**- Limited data wale users 📶**\n\n"
-        f"**🔑 Login:** {login}\n"
-        f"**🛡️ Access:** {access}\n"
-        f"**👑 Owner:** {OWNER_USERNAME}"
+        "**VILLAN — Restricted Content Saver**\n\n"
+        "*Save restricted content, fast and private.*\n\n"
+        "**Features**\n"
+        "• Restriction bypass\n"
+        "• Fast file-ID copy, where supported\n"
+        "• Bulk batch, up to 1000 items\n"
+        "• Public + private channels\n"
+        "• Rename, caption, watermark, thumbnail\n\n"
+        f"Login: {login}\n"
+        f"Access: {access}\n"
+        f"Owner: {OWNER_USERNAME}"
     )
 
 
@@ -2411,56 +2455,44 @@ def _page_kb():
 
 
 COMMANDS_TEXT = (
-    "**📋 COMMANDS**\n\n"
-    "**👤 User Commands:**\n"
-    "**• `/login` — Apne number se login**\n"
-    "**• `/logout` — Session khatam karo**\n"
-    "**• `/batch` — Bulk extraction (range)**\n"
-    "**• `/public` — Public channel fast copy**\n"
-    "**• `/clone` — Group folders clone karo**\n"
-    "**• `/settings` — Customize panel**\n"
-    "**• `/plan` — Apna plan dekho**\n"
-    "**• `/buy` — Premium kharido**\n"
-    "**• `/help` — Usage guide**\n"
-    "**• `/cancel` — Chal raha task roko**\n"
-    "**• Direct link bhejo — single file extract**\n\n"
-    "**👑 Owner Commands:**\n"
-    "**• `/paid <id> <days>` • `/allow` • `/unallow` • `/users`**"
+    "**VILLAN — Commands**\n\n"
+    "`/login` — Sign in with your number\n"
+    "`/logout` — Sign out\n"
+    "`/batch` — Bulk extraction\n"
+    "`/public` — Public channel fast copy\n"
+    "`/clone` — Clone group folders\n"
+    "`/settings` — Rename, caption, watermark\n"
+    "`/plan` — Your plan\n"
+    "`/buy` — Premium\n"
+    "`/help` — Guide\n"
+    "`/cancel` — Stop current task\n"
+    "Send a link directly for a single file.\n\n"
+    "**Owner:** `/paid <id> <days>` • `/allow` • `/unallow` • `/users`"
 )
 
 DISCLAIMER_TEXT = (
-    "**⚖️ Legal Notice**\n\n"
-    "**Ye bot:**\n"
-    "**• Koi file store nahi karta**\n"
-    "**• Kisi illegal activity ko endorse nahi karta**\n"
-    "**• Sirf tools provide karta hai**\n"
-    "**• Users apne actions ke khud zimmedar hain**\n\n"
-    "**Bot use karke tum agree karte ho:**\n"
-    "**• Local laws follow karoge**\n"
-    "**• Copyright material ka abuse nahi karoge**\n"
-    "**• Saare risks tumhare khud ke honge**"
+    "**Legal Notice**\n\n"
+    "This bot stores no files and endorses no illegal activity. "
+    "It provides tools only. You are responsible for your own use, "
+    "local laws, and copyright compliance."
 )
 
 WARNINGS_TEXT = (
-    "**🔞 Safety First!**\n\n"
-    "**🚫 Apna session string kabhi kisi ke saath share mat karo**\n"
-    "**🛡️ Testing ke liye secondary accounts use karo**\n"
-    "**⚖️ Copyright laws ka respect karo**\n"
-    "**💡 Security ke liye saari activities log hoti hain**\n\n"
-    "**❌ Strictly Prohibited:**\n"
-    "**• Child exploitation material**\n"
-    "**• Copyright infringement**\n"
-    "**• Scam / Phishing attempts**\n"
-    "**• Illegal transactions**"
+    "**Safety**\n\n"
+    "• Never share your session string.\n"
+    "• Use a secondary account for testing.\n"
+    "• Respect copyright law.\n\n"
+    "**Prohibited:** child exploitation material, copyright infringement, "
+    "scams, phishing, illegal transactions."
 )
 
 ADMIN_TEXT = (
-    "**👑 ADMIN PANEL**\n\n"
-    "**• `/paid <user_id> <days>` — Premium plan do**\n"
-    "**• `/allow <user_id>` — Lifetime free access**\n"
-    "**• `/unallow <user_id>` — Access hatao**\n"
-    "**• `/users` — Paid + allowed users ki list**\n\n"
-    "**Payment manual hai (UPI) — plan yahi se activate hota hai.**"
+    "**Admin Panel**\n\n"
+    "`/paid <user_id> <days>` — Grant premium\n"
+    "`/allow <user_id>` — Lifetime access\n"
+    "`/unallow <user_id>` — Remove access\n"
+    "`/users` — Paid + allowed users\n\n"
+    "Payment is manual (UPI). Plans activate here."
 )
 
 
@@ -2576,9 +2608,9 @@ async def cancel_handler(client, message):
         ev.set()
         hit = True
     if hit:
-        await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
+        await message.reply_text("🛑 Task cancelled.")
     else:
-        await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
+        await message.reply_text("Nothing active to cancel.")
 
 
 # --- OWNER ADMIN COMMANDS ---
@@ -2586,7 +2618,7 @@ async def cancel_handler(client, message):
 async def allow_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Owner only.")
         return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
@@ -2607,7 +2639,7 @@ async def allow_handler(client, message):
 async def unallow_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Owner only.")
         return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
@@ -2632,7 +2664,7 @@ async def unallow_handler(client, message):
 async def users_handler(client, message):
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Owner only.")
         return
     free = sorted(u for u in _get_allowed() if u != OWNER_ID)
     free_lines = "\n".join(f"• `{x}`" for x in free) or "—"
@@ -2654,7 +2686,7 @@ async def paid_handler(client, message):
     """Owner kisi ko time-based paid access de: /paid <user_id> <days>"""
     uid = message.chat.id
     if not _is_owner(uid):
-        await message.reply_text("⛔ Sirf owner ye command chala sakta hai.")
+        await message.reply_text("⛔ Owner only.")
         return
     parts = message.text.split()
     if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
@@ -2691,7 +2723,7 @@ async def plan_handler(client, message):
     """User apna plan premium card style me dekhe."""
     uid = message.chat.id
     if not _is_allowed(uid):
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     card = await _premium_card(uid, client)
     has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
@@ -2703,26 +2735,14 @@ async def plan_handler(client, message):
 async def help_handler(client, message):
     """Bot kaise use karein — poori guide."""
     help_text = (
-        "🦅 **VILLAN BOT — HELP**\n\n"
-        "**Bot kaise use karein:**\n\n"
-        "1️⃣ `/login` — Apne Telegram number se login karo\n"
-        "   (OTP aayega, 2-step password ho to wo bhi)\n\n"
-        "2️⃣ `/batch` — Phir channel ka **start link** bhejo,\n"
-        "   phir **end link** bhejo\n"
-        "   _Ya seedha ek message me range bhejo:_\n"
-        "   `https://t.me/c/123456789/100-110`\n\n"
-        "3️⃣ Files tumhe mil jayengi ⚡\n\n"
-        "**Commands:**\n"
-        "• `/start` — Bot shuru karo\n"
-        "• `/login` — Number se login\n"
-        "• `/logout` — Logout\n"
-        "• `/batch` — Batch download\n"
-        "• `/settings` — Rename, caption, watermark\n"
-        "• `/plan` — Apna plan dekho\n"
-        "• `/buy` — Premium kharido\n"
-        "• `/cancel` — Chal raha kaam roko\n\n"
-        f"👑 **Owner:** `{OWNER_USERNAME}`\n"
-        "_Access ya premium ke liye owner se contact karo._"
+        "**VILLAN — Guide**\n\n"
+        "1. `/login` — Sign in with your number (OTP, then 2FA if set).\n"
+        "2. `/batch` — Send the first link, then the last link.\n"
+        "   Or send a range directly: `https://t.me/c/123456789/100-110`\n"
+        "3. Files arrive one by one.\n\n"
+        "`/settings` — Rename, caption, watermark\n"
+        "`/plan` — Your plan • `/buy` — Premium • `/cancel` — Stop\n\n"
+        f"Owner: `{OWNER_USERNAME}`"
     )
     await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -2731,12 +2751,10 @@ async def help_handler(client, message):
 async def buy_handler(client, message):
     """Premium kharidne ke liye owner ka username dikhao."""
     await message.reply_text(
-        "💎 **VILLAN PREMIUM** 💎\n\n"
-        "Premium lene ke liye owner se contact karo:\n"
-        f"👑 `{OWNER_USERNAME}`\n\n"
-        "Unhe message karo:\n"
-        "`Hi, mujhe premium chahiye`\n\n"
-        "Payment ke baad tumhara plan activate ho jayega! 🚀",
+        "**VILLAN Premium**\n\n"
+        f"Contact the owner: `{OWNER_USERNAME}`\n"
+        "Message: `Hi, I want premium`\n"
+        "Your plan activates after payment.",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -2747,7 +2765,7 @@ async def logout_handler(client, message):
     await _cleanup_login(uid)
     await _logout_user(uid)
     await message.reply_text(
-        "👋 Logout ho gaya. Dobara use karne ke liye `/login` karo."
+        "👋 Logged out. Use /login to sign in again."
     )
 
 
@@ -2757,7 +2775,7 @@ async def batch_start_handler(client, message):
         await _send_join_wall(message)
         return
     if not _is_allowed(message.chat.id):
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /batch for user {message.chat.id}", flush=True)
     # Purani adhuri setting-input state ho to hatao, warna batch ka link
@@ -2767,12 +2785,9 @@ async def batch_start_handler(client, message):
     PUBLIC_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
-        "**🔗 VILLAN BATCH SYSTEM**\n"
-        "**━━━━━━━━━━━━━━━**\n"
-        "**STEP 1/2 — Source Selection**\n\n"
-        "**📎 Start message ka link bhejein**\n"
-        "**jahan se extraction shuru karna hai.**\n\n"
-        "**❌ Cancel:** `/cancel`",
+        "**VILLAN Batch**\n\n"
+        "Send the first message link.\n\n"
+        "Cancel: `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -2783,7 +2798,7 @@ async def clone_start_handler(client, message):
         await _send_join_wall(message)
         return
     if not _is_allowed(message.chat.id):
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /clone for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
@@ -2819,7 +2834,7 @@ async def public_start_handler(client, message):
         await _send_join_wall(message)
         return
     if not _is_allowed(message.chat.id):
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /public for user {message.chat.id}", flush=True)
     SETTING_STATES.pop(message.chat.id, None)
@@ -2858,7 +2873,7 @@ async def login_start_handler(client, message):
         return
     if not _is_allowed(uid):
         await message.reply_text(
-            "⛔ Tumhe is bot ki permission nahi hai. Owner se contact karo."
+            "⛔ Access denied. Owner se contact karo."
         )
         return
     await _cleanup_login(uid)
@@ -3236,10 +3251,10 @@ def apply_video_watermark(video_path, text, tmpdir):
 async def settings_handler(client, message):
     uid = message.chat.id
     if not _is_allowed(uid):
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     await message.reply_text(
-        "⚙️ **Customize by your end and Configure your settings...**",
+        "⚙️ Settings",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=settings_keyboard(uid),
     )
@@ -3313,7 +3328,7 @@ async def settings_callbacks(client, query):
     elif data == "st_logout":
         await _cleanup_login(uid)
         await _logout_user(uid)
-        await query.message.reply_text("👋 Logout ho gaya. `/login` se dobara login karo.")
+        await query.message.reply_text("👋 Logged out. Use /login to sign in again.")
     elif data == "st_thumb":
         SETTING_STATES[uid] = {"action": "set_thumb"}
         await query.message.reply_text(
@@ -3448,7 +3463,7 @@ async def thumb_photo_handler(client, message):
         return
     if not _is_allowed(uid):
         SETTING_STATES.pop(uid, None)
-        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        await message.reply_text("⛔ Access denied.")
         return
     SETTING_STATES.pop(uid, None)
     file_id = message.photo[-1].file_id
@@ -3480,7 +3495,7 @@ async def message_dispatcher(client, message):
     if user_id in LOGIN_STATES:
         if not _is_allowed(user_id):
             await _cleanup_login(user_id)
-            await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+            await message.reply_text("⛔ Access denied.")
             return
         await handle_login_step(client, message)
         return
@@ -3488,7 +3503,7 @@ async def message_dispatcher(client, message):
     # Permission gate: sirf allowed users
     if not _is_allowed(user_id):
         await message.reply_text(
-            "⛔ Tumhe is bot ko use karne ki permission nahi hai.\nOwner se contact karo."
+            "⛔ Access denied. Contact the owner."
         )
         return
 
@@ -3517,7 +3532,7 @@ async def message_dispatcher(client, message):
     ):
         chat_id, start_id = parse_tg_link(text)
         if not chat_id or not start_id:
-            await message.reply_text("❌ **Invalid link!** Sahi public channel link bhejiye.")
+            await message.reply_text("❌ Invalid link. Send a valid public channel link.")
             return
         if isinstance(chat_id, int):
             # t.me/c/... = private link — /public sirf public ke liye hai
@@ -3533,13 +3548,10 @@ async def message_dispatcher(client, message):
             "start_id": start_id,
         }
         await message.reply_text(
-            "**⚡ VILLAN PUBLIC FAST**\n"
-            "**━━━━━━━━━━━━━━━**\n\n"
-            f"**✅ Start Locked:** `{start_id}`\n\n"
-            "**📎 Ab aakhiri (last) message ka**\n"
-            "**link bhejein jahan tak**\n"
-            "**fast copy karna hai.**\n\n"
-            "**❌ Cancel:** `/cancel`",
+            "**VILLAN Public Fast**\n\n"
+            f"Start locked: `{start_id}`\n"
+            "Send the last message link.\n\n"
+            "Cancel: `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -3550,7 +3562,7 @@ async def message_dispatcher(client, message):
     ):
         chat_id, end_id = parse_tg_link(text)
         if not chat_id or not end_id:
-            await message.reply_text("❌ **Invalid link!** Sahi public channel link bhejiye.")
+            await message.reply_text("❌ Invalid link. Send a valid public channel link.")
             return
         if isinstance(chat_id, int):
             await message.reply_text(
@@ -3572,7 +3584,7 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"⚡ **Public Fast Started!** `{total_files}` items (file_id instant)."
+            f"Public fast started — `{total_files}` items."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg,
                         public_fast=True)
@@ -3584,7 +3596,7 @@ async def message_dispatcher(client, message):
     ):
         chat_id, start_id = parse_tg_link(text)
         if not chat_id or not start_id:
-            await message.reply_text("❌ **Invalid link!** Sahi channel link bhejiye.")
+            await message.reply_text("❌ Invalid link. Send a valid channel link.")
             return
 
         USER_STATES[user_id] = {
@@ -3593,14 +3605,10 @@ async def message_dispatcher(client, message):
             "start_id": start_id,
         }
         await message.reply_text(
-            "**🔗 VILLAN BATCH SYSTEM**\n"
-            "**━━━━━━━━━━━━━━━**\n"
-            "**STEP 2/2 — Range Complete**\n\n"
-            f"**✅ Start Locked:** `{start_id}`\n\n"
-            "**📎 Ab aakhiri (last) message ka**\n"
-            "**link bhejein jahan tak**\n"
-            "**extraction karna hai.**\n\n"
-            "**❌ Cancel:** `/cancel`",
+            "**VILLAN Batch**\n\n"
+            f"Start locked: `{start_id}`\n"
+            "Send the last message link.\n\n"
+            "Cancel: `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -3611,7 +3619,7 @@ async def message_dispatcher(client, message):
     ):
         chat_id, end_id = parse_tg_link(text)
         if not chat_id or not end_id:
-            await message.reply_text("❌ **Invalid link!** Sahi channel link bhejiye.")
+            await message.reply_text("❌ Invalid link. Send a valid channel link.")
             return
 
         state = USER_STATES.pop(user_id)
@@ -3629,7 +3637,7 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"🦅 **Batch Started!** `{total_files}` items queued (ek-ek karke)."
+            f"Batch started — `{total_files}` items."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
         return
@@ -3652,7 +3660,7 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"⏳ `{total}` item(s) processing (ek-ek karke)..."
+            f"Processing `{total}` items…"
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
 
@@ -3687,7 +3695,7 @@ async def main():
     print(f"👉 VERSION: {VERSION}", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
-    print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s "
+    print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
           f"FETCH_CHUNK={FETCH_CHUNK}", flush=True)
     print(f"👉 MULTI_DL: {MULTI_PARTS} parts/file (ek file ke parts parallel, order sequential)", flush=True)
     if not OWNER_ID and SESSION_STRING:
