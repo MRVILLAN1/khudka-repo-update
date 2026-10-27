@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v50"
+VERSION = "v51"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -746,6 +746,15 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
         return None
     tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
     info["tmpdir"] = tmpdir
+    # v51: download shuru hote hi dikh jaye (pehle sirf complete hone par
+    # pata chalta tha, badi file par user ko lagta tha download start hi
+    # nahi hua). Log me size ke saath, user ko prog_msg par.
+    print(f"[DOWNLOAD] Starting msg {msg_id} ({info.get('file_size', 0)} bytes)", flush=True)
+    if prog_msg is not None:
+        try:
+            await safe_edit(prog_msg, f"📥 Downloading • ID `{msg_id}` • {humanbytes(info.get('file_size', 0))}")
+        except Exception:
+            pass
     try:
         dl_path = os.path.join(tmpdir, info["file_name"])
         last_update = [time.time()]
@@ -885,6 +894,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
     session = await _get_media_session(user_client, dc_id)
     tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
     info["tmpdir"] = tmpdir
+    print(f"[DOWNLOAD] Starting msg {msg_id} ({file_size} bytes, multi)", flush=True)
     dl_path = os.path.join(tmpdir, info["file_name"])
     try:
         n_parts = (file_size + MULTI_CHUNK - 1) // MULTI_CHUNK
@@ -1812,6 +1822,19 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
 
     ids = list(range(start_id, end_id + 1))
     total = len(ids)
+    # v51: naya batch purane batch ko rok de. Pehle purana batch chalta
+    # rehta tha (cancel event overwrite ho jata tha) aur badi file ka
+    # download bandwidth khata rehta tha, jisse naye batch ki download
+    # queue/slow hoti thi. Ab purana event set karo — wo agle file
+    # boundary ya countdown par ruk jayega (chal rahi download us file
+    # ke khatam hone par rukegi, beech me nahi todegi).
+    _old_ev = ACTIVE_BATCHES.get(owner_id)
+    if _old_ev is not None:
+        try:
+            _old_ev.set()
+        except Exception:
+            pass
+        print(f"[BATCH] Previous batch for {owner_id} stopped (new batch started)", flush=True)
     cancel_event = asyncio.Event()
     ACTIVE_BATCHES[owner_id] = cancel_event
     stats = BatchStats(total)
@@ -1830,7 +1853,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     # v44 PIPELINE: is file ka metadata + (zaroorat ho to) download. Jab ye
     # background task agli file ke liye chal raha hota hai, tab current file
     # bot se upload ho rahi hoti hai — dono connections alag, time bachta hai.
-    async def _prepare(mid, pre, holder):
+    async def _prepare(mid, pre, holder, prog_msg=None):
         try:
             info = await fetch_one(fetch_client, src_chat, mid, preloaded=pre)
             holder["info"] = info
@@ -1848,7 +1871,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                 if needs_dl:
                     try:
                         await download_file(
-                            fetch_client, info, None, stats, owner_id, client)
+                            fetch_client, info, prog_msg, stats, owner_id, client)
                     except Exception as e:
                         print(f"Prefetch download fail ({mid}): {e}", flush=True)
             return info
@@ -1892,6 +1915,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     pre = fetched[mid]  # chunk se mil gaya (network call skip)
                 else:
                     pre = "MISSING"     # chunk OK tha, ye id delete/invalid hai
+                early_prog = False
                 if pending_task is not None and pending_mid == mid:
                     # v44: ye file background me pehle se prepare ho rahi thi
                     info = await pending_task
@@ -1909,7 +1933,24 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                             pending_holder = None
                     holder = {}
                     holders.append(holder)
-                    info = await _prepare(mid, pre, holder)
+                    # v51 first-file fix: prog_msg PEHLE banao, phir download
+                    # karo. Pehle download prog_msg=None se chupchaap hota
+                    # tha — badi file par user ko 4 min tak kuch nahi dikhta
+                    # tha, lagta tha download start hi nahi hua. Ab download
+                    # progress (5 sec me 1 baar) isi message par dikhega.
+                    if prog_msg:
+                        try:
+                            await prog_msg.delete()
+                        except Exception:
+                            pass
+                    try:
+                        prog_msg = await client.send_message(
+                            owner_id, "⏳ Preparing…",
+                            parse_mode=enums.ParseMode.MARKDOWN)
+                    except Exception:
+                        prog_msg = None
+                    early_prog = True
+                    info = await _prepare(mid, pre, holder, prog_msg)
                 if cancel_event.is_set():
                     break
                 if info == "PEER_INVALID":
@@ -1930,18 +1971,21 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     await _update_batch_status(status_msg, stats)
                     continue
                 # HAR FILE ke liye NAYA progress message (neeche se aayega)
-                # Purana delete karo, naya banao — taaki sent file ke neeche dikhe
-                if prog_msg:
+                # Pending-task wali file ke liye purana delete karke naya
+                # banao; inline (early) file ka prog_msg pehle se is file
+                # ka hai, use wahi rehne do taaki download progress na mite.
+                if not early_prog:
+                    if prog_msg:
+                        try:
+                            await prog_msg.delete()
+                        except Exception:
+                            pass
                     try:
-                        await prog_msg.delete()
+                        prog_msg = await client.send_message(
+                            owner_id, "⏳ Preparing…",
+                            parse_mode=enums.ParseMode.MARKDOWN)
                     except Exception:
-                        pass
-                try:
-                    prog_msg = await client.send_message(
-                        owner_id, "⏳ Preparing…",
-                        parse_mode=enums.ParseMode.MARKDOWN)
-                except Exception:
-                    prog_msg = None
+                        prog_msg = None
                 # v44 PIPELINE: is file ke UPLOAD ke dauraan agli file ka
                 # download background me shuru kar do (order same rahega)
                 if (pending_task is None and ci + 1 < len(chunk)
@@ -2000,7 +2044,11 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         await asyncio.sleep(gap)
             i += len(chunk)
     finally:
-        ACTIVE_BATCHES.pop(owner_id, None)
+        # v51: sirf apna hi cancel handle hatayo — purane batch ka finally
+        # naye batch ka handle na uda de (warna naye batch ka /cancel kaam
+        # nahi karega).
+        if ACTIVE_BATCHES.get(owner_id) is cancel_event:
+            ACTIVE_BATCHES.pop(owner_id, None)
         # Background prefetch task roko + uske temp files saaf karo
         if locals().get("pending_task") is not None:
             try:
