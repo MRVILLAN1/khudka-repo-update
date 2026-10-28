@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v51"
+VERSION = "v54"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -715,6 +715,11 @@ def _info_from_msg(target_msg, msg_id):
         "file_name": os.path.basename(fname),
         "caption": target_msg.caption or "",
         "target_msg": target_msg,  # slow path download ke liye
+        # v53: reference kab fetch hua — lambi throttled batch me chunk
+        # fetch ke ghanton baad download ho to reference expire ho jata
+        # hai (2026-10-28 05:45, msgs 405-407). Age dekh kar proactive
+        # refetch karenge, fail hone ka wait nahi karenge.
+        "fetched_at": time.time(),
         "tmpdir": None,
         "file_path": None,
         "thumb_path": None,
@@ -770,6 +775,27 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
         )
         if not file_path or not os.path.exists(file_path):
             return None
+        # v52 0-BYTE GUARD: 2026-10-28 logs me download ke baad khaali
+        # (0 byte) file upload par gayi aur "File size equals to 0 B" se
+        # fail hui. Aisi file ko kabhi file_path mat banao — wapas
+        # None do taaki wrapper retry/fail saaf tareeke se kare, aur
+        # upload_one kabhi khaali file send karne ki koshish na kare.
+        # Document/video/audio par exact size bhi check karo (photo par
+        # sirf 0-byte check, uska reported size thumb se alag ho sakta hai).
+        _got = os.path.getsize(file_path)
+        _exp = info.get("file_size", 0) or 0
+        if _got == 0 or (_exp > 0 and info.get("kind") in (
+                "document", "video", "audio", "voice", "video_note",
+                "animation") and _got != _exp):
+            print(f"[SIZE] Download kharab msg {msg_id}: mila {_got} bytes, "
+                  f"chahiye {_exp} bytes", flush=True)
+            info["download_error"] = (
+                f"size mismatch {_got} != {_exp}")
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+            return None
         if info.get("kind") == "photo" and not file_path.lower().endswith(
                 (".jpg", ".jpeg", ".png", ".webp")):
             # Photo bina sahi extension ke upload nahi hoti (PHOTO_EXT_INVALID)
@@ -809,7 +835,13 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
 # speed thodi kam, par batch zyada steady chalta hai. Env se wapas
 # 6 kar sakte ho (MULTI_PARTS=6), par flood wale session par 3 hi rakho.
 MULTI_PARTS = max(1, min(8, int(os.environ.get("MULTI_PARTS", "3"))))
-MULTI_MIN_SIZE = int(os.environ.get("MULTI_MIN_SIZE", str(10 * 1024 * 1024)))
+# v52: 10MB -> 1MB. 2026-10-28 logs me 5-9MB ke BIJZLI PDF (DC4) classic
+# path par ja rahe the, aur classic download_media HAR file par DC4 ko
+# naya auth-export karta hai -> ExportAuthorization FloodWait (121s...).
+# Cached multi session me auth-export sirf pehli baar hota hai, isliye
+# chhoti PDF bhi ab cached session se download hongi. MULTI_PARTS=1 live
+# hai to parts sequential hi rahenge, order/speed rule same hai.
+MULTI_MIN_SIZE = int(os.environ.get("MULTI_MIN_SIZE", str(1 * 1024 * 1024)))
 MULTI_CHUNK = 1024 * 1024  # 1MB parts (Pyrogram ke get_file jaisa)
 
 # v44 SPEED: media DC session CACHE. Pehle HAR file par naya media session
@@ -984,7 +1016,8 @@ async def _refresh_info(user_client, info):
     new = _info_from_msg(fresh, info["msg_id"])
     if not isinstance(new, dict) or new.get("kind") in ("text", "too_big"):
         return False
-    for k in ("file_id", "file_size", "file_name", "caption", "target_msg"):
+    for k in ("file_id", "file_size", "file_name", "caption", "target_msg",
+              "fetched_at"):
         if k in new:
             info[k] = new[k]
     info["file_path"] = None
@@ -995,13 +1028,41 @@ async def _refresh_info(user_client, info):
     return True
 
 
+def _flood_seconds(err_text):
+    """FloodWait error string se wait seconds nikalo (None = FloodWait nahi)."""
+    if not err_text:
+        return None
+    if "FLOOD_WAIT" not in err_text and "FloodWait" not in err_text:
+        return None
+    m = re.search(r"wait of (\d+) seconds", err_text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"FLOOD_WAIT_(\d+)", err_text)
+    if m:
+        return int(m.group(1))
+    return 60
+
+
 async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
     """v41 wrapper: pehle multi-connection download try karo, fail par classic.
+    v52: FloodWait par file ko turant fail mat karo — poora wait karke
+    ek baar dobara try karo. 2026-10-28 logs me 121s ExportAuthorization
+    FloodWait par file turant fail ho rahi thi (wrapper sirf
+    FILE_REFERENCE_EXPIRED par retry karta tha).
     File order abhi bhi sequential hai — sirf ek file ke parts parallel aate hain.
     v47: agar download FILE_REFERENCE_EXPIRED se fail ho, to ek baar fresh
     reference lekar retry karo (purane reference par dobara try karna bekaar
-    hai — multi aur classic dono wahi stale reference use karte the)."""
+    hai — multi aur classic dono wahi stale reference use karte the).
+    v53: do naye cover. (1) PROACTIVE: reference 30 min se purana ho
+    (chunk fetch ke baad lambi throttling) to download se PEHLE hi fresh
+    fetch karo — fail hone ka wait mat karo. (2) SIZE-MISMATCH bhi stale
+    hai: 2026-10-28 05:45 me expired error ke baad download ne khaali
+    file ko success maan liya tha, isliye v47 ka expired-check kabhi chala
+    hi nahi (koi [REFETCH] line nahi aayi). Ab size mismatch / 0-byte par
+    bhi fresh fetch + retry hoga, sirf expired string par nahi."""
     msg_id = info.get("msg_id")
+    # v53: reference age limit (env se badal sakte ho, default 30 min)
+    _refresh_age = int(os.environ.get("REFRESH_AGE_SEC", "1800"))
 
     async def _attempt():
         if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
@@ -1037,16 +1098,55 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
         return await download_file_classic(
             user_client, info, prog_msg, stats, uid, bot_client)
 
+    # v53 PROACTIVE REFRESH: chunk me fetch hua reference purana ho to
+    # pehle hi fresh kar lo. Refetch fail ho to purane reference se hi
+    # try karo (batch is wajah se fail nahi hoga).
+    _fetched_at = info.get("fetched_at") or 0
+    if user_client and info.get("target_msg") and _fetched_at:
+        _age = time.time() - _fetched_at
+        if _age > _refresh_age:
+            print(f"[REFETCH] purana reference ({msg_id}, age {int(_age)}s), "
+                  f"download se pehle fresh fetch", flush=True)
+            await _refresh_info(user_client, info)
+
     result = await _attempt()
     if result:
         return result
-    # v47: sirf expired-reference case me ek baar fresh fetch + retry.
-    # Baaki failures (network, FloodWait, deleted msg) par dobara try nahi —
+    # v52: FloodWait par ek baar poora wait + retry. Pyrogram sirf 60s
+    # tak ke wait khud absorb karta hai (sleep_threshold=60); usse bade
+    # wait (jaise 121s ExportAuthorization) exception bankar aate hain
+    # aur pehle file turant fail ho jati thi. Wait karke retry karne se
+    # wo file bach jayegi — wait ke dauraan batch rukega, fail nahi hoga.
+    _fw = _flood_seconds(info.get("download_error") or "")
+    if _fw is not None:
+        print(f"[RETRY] FloodWait {msg_id}: {_fw}s wait karke dobara try",
+              flush=True)
+        if prog_msg is not None:
+            try:
+                await safe_edit(
+                    prog_msg,
+                    f"⏳ Telegram limit — {_fw}s wait, phir dobara try • ID `{msg_id}`")
+            except Exception:
+                pass
+        await asyncio.sleep(_fw + 5)
+        info["download_error"] = None
+        info["file_path"] = None
+        result = await _attempt()
+        if result:
+            return result
+    # v53: expired-reference case me ek baar fresh fetch + retry — AUR
+    # size-mismatch case me bhi (v52 ka classic guard khaali/galat-size
+    # file par download_error="size mismatch..." set karta hai, expired
+    # string nahi; isliye purana check us case me kabhi trigger nahi
+    # hota tha aur dobara download bhi wahi stale reference se hota tha).
+    # Baaki failures (network, deleted msg) par dobara try nahi —
     # wo file normal fail count hogi, batch aage badhega.
-    if "FILE_REFERENCE_EXPIRED" not in (info.get("download_error") or ""):
+    _err = info.get("download_error") or ""
+    if ("FILE_REFERENCE_EXPIRED" not in _err
+            and "size mismatch" not in _err):
         return result
-    print(f"[REFETCH] stale reference ({msg_id}), fresh fetch karke retry",
-          flush=True)
+    print(f"[REFETCH] stale reference ({msg_id}), fresh fetch karke retry "
+          f"(error: {_err[:80]})", flush=True)
     if not await _refresh_info(user_client, info):
         return result
     return await _attempt()
@@ -1560,6 +1660,21 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         # v44 PIPELINE: run_batch agli file pehle se background me download
         # kar chuka hota hai — info["file_path"] mila to wahi use karo.
         fp = info.get("file_path")
+        # v52: prefetch file ko bina size check ke "mil gayi" mat maano.
+        # 2026-10-28 me khaali prefetch file seedha upload par gayi aur
+        # "File size equals to 0 B" se fail hui. Kharab file ko yahin
+        # discard karo taaki neeche dobara download ho.
+        if fp and os.path.exists(fp):
+            _sz = os.path.getsize(fp)
+            _exp = info.get("file_size", 0) or 0
+            if _sz == 0 or (_exp > 0 and info.get("kind") in (
+                    "document", "video", "audio", "voice", "video_note",
+                    "animation") and _sz != _exp):
+                print(f"[SIZE] Prefetch file kharab msg {info['msg_id']}: "
+                      f"{_sz} bytes (chahiye {_exp}), dobara download",
+                      flush=True)
+                info["file_path"] = None
+                fp = None
         if fp and os.path.exists(fp):
             print(f"📦 Prefetch se file mil gayi msg {info['msg_id']} "
                   "(download pehle se ho chuki)", flush=True)
@@ -3713,6 +3828,72 @@ async def message_dispatcher(client, message):
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
 
 
+
+# --- v54: DEPLOY BROADCAST ---
+# Har deploy (= har bot restart) par sab users ko ek short message jata hai
+# taaki unhe pata chale bot update hua hai aur purana batch restart karna hai.
+# Band karna ho to Koyeb env me UPDATE_BROADCAST=0 set karo (default ON).
+# Gap: users ke beech itne second ka gap (default 1s) taaki broadcast se
+# FloodWait na lage. Ye background task me chalta hai, bot start hone me
+# ya chal rahe batch me der nahi karta.
+UPDATE_BROADCAST = os.environ.get("UPDATE_BROADCAST", "1").strip() != "0"
+UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
+
+
+def _broadcast_user_ids():
+    """Sab jaane-pehchane users: allowed + paid subs + login sessions + topics."""
+    ids = set()
+    try:
+        ids |= _get_allowed()
+    except Exception:
+        pass
+    for _src in (_load_subs(), _load_json(SESSIONS_FILE, {}),
+                 _load_json(TOPICS_FILE, {})):
+        try:
+            for _k in _src.keys():
+                if str(_k).isdigit():
+                    ids.add(int(_k))
+        except Exception:
+            pass
+    ids.discard(0)
+    return sorted(ids)
+
+
+async def _broadcast_update():
+    if not UPDATE_BROADCAST:
+        print("[BROADCAST] OFF (UPDATE_BROADCAST=0), koi message nahi bheja",
+              flush=True)
+        return
+    users = _broadcast_user_ids()
+    print(f"[BROADCAST] {len(users)} users ko BOT UPDATED message bhej raha hun",
+          flush=True)
+    sent = failed = 0
+    text = (
+        "<b>\U0001f504 BOT UPDATED</b>\n\n"
+        "<b>Please restart your download.</b>\n"
+        "<b>Agar tumhara batch ruk gaya ho to dobara /batch bhejo "
+        "- naya version live hai.</b>"
+    )
+    for uid in users:
+        try:
+            await app.send_message(uid, text, parse_mode=enums.ParseMode.HTML)
+            sent += 1
+        except FloodWait as e:
+            try:
+                await asyncio.sleep(int(e.value) + 2)
+                await app.send_message(uid, text,
+                                       parse_mode=enums.ParseMode.HTML)
+                sent += 1
+            except Exception as ex:
+                failed += 1
+                print(f"[BROADCAST] fail {uid}: {ex}", flush=True)
+        except Exception as e:
+            failed += 1
+            print(f"[BROADCAST] fail {uid}: {e}", flush=True)
+        await asyncio.sleep(UPDATE_BROADCAST_GAP)
+    print(f"[BROADCAST] done: sent={sent} failed={failed}", flush=True)
+
+
 # --- MAIN ENGINE ---
 async def main():
     await start_web_server()
@@ -3758,6 +3939,10 @@ async def main():
         await _backup_restore_all()
     else:
         print("👉 BACKUP_CHAT_ID: not set (bina volume ke redeploy par data udega)", flush=True)
+
+    # v54: har deploy par sab users ko update message (background me,
+    # taaki bot ke start hone me der na lage; chal raha batch nahi rukta)
+    asyncio.create_task(_broadcast_update())
 
     await idle()
     await app.stop()
