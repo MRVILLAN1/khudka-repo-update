@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v62"
+VERSION = "v63"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2598,8 +2598,13 @@ async def run_create(client, uid, group_name, topics, status_msg):
 #   hota hai). Username 5-32 chars, pehla char letter, sirf a-z/0-9/_.
 # - Ek run me MAX 10 username (user ne 10 bola hai). Zyada bheje to
 #   pehle 10 banenge, baaki ki list final message me bata di jayegi.
-# - Channel ka title = username hi rakha jata hai (user Telegram app me
-#   baad me rename kar sakta hai). Username taken/invalid ho to wo
+# - v63: Channel ka title = USER NE DIYA HUA EK HI NAAM hota hai
+#   (jaise "Dholu Bholu Kids"), username alag-alag hote hain.
+#   User ne pehle poochha tha (2026-10-29): 10 channel ek hi naam se
+#   banenge, sirf username alag hoga. Isliye /mkchannels ab do-step
+#   hai — pehle naam, phir 10 username. Purane v60-v62 design me title
+#   username hi hota tha, jo 10 alag naam bana deta — wo galat tha.
+#   Username taken/invalid ho to wo
 #   channel banake chhoda nahi jata — banaya hua channel delete karke
 #   us username ko failed list me dala jata hai, taaki orphan private
 #   channel na bachen.
@@ -2618,7 +2623,7 @@ async def run_create(client, uid, group_name, topics, status_msg):
 #   Bot khud channels me post nahi karta (bot un channels ka admin nahi
 #   hai) — userbot creator hai, isliye wahi bhejta hai. Har channel ke
 #   beech 2 sec ka gap hai.
-MKCHANNELS_STATES = {}  # uid -> {"step": "WAITING_USERNAMES"}
+MKCHANNELS_STATES = {}  # uid -> {"step": "WAITING_NAME"/"WAITING_USERNAMES", "title": str}
 SENDALL_STATES = {}  # uid -> True (agla message source hoga)
 MKCHANNELS_MAX = 10
 # v61: user ne bola — ek channel banao, phir 2 MIN ka timer, phir second,
@@ -2671,13 +2676,15 @@ def _mk_split_raw(text):
     return raw
 
 
-async def _mk_create_public_channel(userbot, username):
+async def _mk_create_public_channel(userbot, username, title=None):
     """Ek PUBLIC channel banao + username set karo.
+    Title = user ka diya hua common naam (v63), na diya ho to username.
     Returns (chat_id, link) ya (None, error_string)."""
     from pyrogram import raw
+    title = (title or username).strip()[:128]
     try:
         upd = await userbot.invoke(raw.functions.channels.CreateChannel(
-            title=username, about="Created by VILLAN bot",
+            title=title, about="Created by VILLAN bot",
             broadcast=True, megagroup=False, forum=False))
     except Exception as e:
         return None, str(e)
@@ -2706,16 +2713,16 @@ async def _mk_create_public_channel(userbot, username):
     return cid, f"https://t.me/{username}"
 
 
-async def run_mkchannels(client, uid, usernames, status_msg):
+async def run_mkchannels(client, uid, usernames, status_msg, title=None):
     _ev = asyncio.Event()
     MKCHANNELS_ACTIVE[uid] = _ev
     try:
-        await _run_mkchannels_inner(client, uid, usernames, status_msg, _ev)
+        await _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=title)
     finally:
         MKCHANNELS_ACTIVE.pop(uid, None)
 
 
-async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev):
+async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=None):
     userbot = await get_userbot(uid)
     if not userbot:
         await message_reply(status_msg, "❌ Pehle `/login` karo — public channel "
@@ -2732,7 +2739,7 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev):
                 failed.append((_rest, "cancel kar diya gaya"))
             break
         try:
-            cid, res = await _mk_create_public_channel(userbot, username)
+            cid, res = await _mk_create_public_channel(userbot, username, title=title)
         except FloodWait as e:
             failed.append((username, f"FloodWait {e.value}s — baaki ruk gaye"))
             print(f"[MKCHANNELS] FloodWait {username}: {e.value}s", flush=True)
@@ -2740,7 +2747,7 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev):
         except Exception as e:
             cid, res = None, str(e)
         if cid:
-            entry = {"username": username, "chat_id": cid, "title": username,
+            entry = {"username": username, "chat_id": cid, "title": (title or username),
                      "link": res}
             by_name[username] = entry
             created.append(entry)
@@ -2757,15 +2764,15 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev):
                 pass
     _channels_save(uid, list(by_name.values()))
     done = ("✅ **Mkchannels complete!**\n"
-            f"📢 Public channels ban gaye: `{len(created)}`")
+            f"📢 Public channels ban gaye: `{len(created)}`\n"
+            f"📛 Sab ka naam: `{title or 'username jaisa'}` (username alag-alag hai)")
     for c in created:
-        done += f"\n• @{c['username']} — {c['link']}"
+        done += f"\n• {c.get('title', c['username'])} — @{c['username']} — {c['link']}"
     if failed:
         done += f"\n❌ Fail hue: `{len(failed)}`"
         for uname, err in failed:
             done += f"\n• @{uname} — {err}"
-    done += ("\n\nℹ️ Channel ka title abhi username hi hai, Telegram app me "
-             "jaake rename kar sakte ho. In channels me bhejne ke liye "
+    done += ("\n\nℹ️ Sab channels ka naam ek hi hai, sirf username alag hai. In channels me bhejne ke liye "
              "`/sendall` use karo (kisi message par reply karke, ya "
              "`/sendall` likh ke agla message bhej ke).")
     await safe_edit(status_msg, done)
@@ -4114,7 +4121,7 @@ COMMANDS_TEXT = (
     "`/public` — Public channel fast copy\n"
     "`/clone` — Clone group folders\n"
     "`/create` — Naya group + folders banao\n"
-    "`/mkchannels` — 10 username se PUBLIC channels banao\n"
+    "`/mkchannels` — Pehle naam, phir 10 username se PUBLIC channels banao (naam ek hi, username alag)\n"
     "`/mychannels` — Tumhare banaye channels ki list\n"
     "`/sendall` — Ek message sab channels me bhejo (reply karke ya agla message bhej ke)\n"
     "`/addchannel` — Pehle se bana channel broadcast list me jodo\n"
@@ -4455,7 +4462,7 @@ async def help_handler(client, message):
         "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya /batch chala diya, to resume latest batch ka hi hoga.\n"
         "6. /clone — Kisi group ke folders + saari messages ko naye PRIVATE group me copy karo: source group ka link bhejo, naya group tumhare account se banega.\n"
         "7. /create — Naya group banao: pehle group ka naam bhejo, phir topics ke naam ek hi message me (har naam ek line par, ya comma se) bhejo, un naam se folders ban jayenge.\n"
-        "8a. /mkchannels — Public channels banao: /mkchannels likho, phir 10 username ek hi message me bhejo (line ya comma se). Channel tumhare login account se banega, title username hi hoga.\n"
+        "8a. /mkchannels — Public channels banao: /mkchannels likho, pehle channel ka NAAM bhejo (ye naam sab 10 me ek hi dikhega), phir 10 username ek hi message me bhejo (line ya comma se). Sirf username alag-alag hoga. Channel tumhare login account se banega.\n"
         "8b. /mychannels — Tumhare banaye channels ki list dekho.\n"
         "8c. /sendall — Ek message sab channels me bhejo: kisi message (video / text / image) par reply karke /sendall likho, ya /sendall likh ke agla message bhejo.\n"
         "8d. /addchannel — Pehle se bana channel jodo: /addchannel likho, phir channel ka link / @username bhejo. Login account us channel ka admin hona chahiye, warna send fail hoga.\n"
@@ -4601,23 +4608,41 @@ async def mkchannels_start_handler(client, message):
     PUBLIC_STATES.pop(message.chat.id, None)
     FBATCH_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
-    MKCHANNELS_STATES[message.chat.id] = {"step": "WAITING_USERNAMES"}
+    # Shortcut: /mkchannels <naam> likha ho to naam wahi maan lo, seedha username poochho
+    args = message.command[1:] if len(message.command) > 1 else []
+    if args:
+        title = " ".join(args).strip()[:128]
+        MKCHANNELS_STATES[message.chat.id] = {"step": "WAITING_USERNAMES", "title": title}
+        await message.reply_text(
+            f"**📢 VILLAN MKCHANNELS — Naam locked: `{title}`**\n"
+            "**━━━━━━━━━━━━━━━**\n\n"
+            "**Ab 10 username bhejo — ek hi message me,**\n"
+            "har username ek nayi line par, ya comma se alag karke.\n"
+            "Jaise:\n"
+            "`myfirstchannel`\n`mysecondchannel`\n\n"
+            "• **Sab 10 channels ka naam ek hi hoga:** `" + title + "`\n"
+            "• Sirf **username alag-alag** hoga, wahi link banega.\n"
+            "• Ek run me **max 10** username — zyada bheje to pehle 10 banenge.\n"
+            "• Username **5-32 chars**, pehla char letter, sirf a-z / 0-9 / _.\n"
+            "• Har channel ke beech **2 MIN ka gap** hai — 10 channel me ~18 min + create time lagega.\n"
+            "**❌ Cancel:** `/cancel`",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+        return
+    MKCHANNELS_STATES[message.chat.id] = {"step": "WAITING_NAME"}
     await message.reply_text(
         "**📢 VILLAN MKCHANNELS — Public channels banao**\n"
         "**━━━━━━━━━━━━━━━**\n\n"
-        "**Ab 10 username bhejo — ek hi message me,**\n"
-        "har username ek nayi line par, ya comma se alag karke.\n"
-        "Jaise:\n"
-        "`myfirstchannel`\n`mysecondchannel`\n"
-        "ya: `myfirstchannel, mysecondchannel`\n"
-        "(`@` lagana zaroori nahi hai.)\n\n"
-        "• Ek run me **max 10** username — zyada bheje to pehle 10 banenge.\n"
-        "• Username **5-32 chars**, pehla char letter, sirf a-z / 0-9 / _.\n"
-        "• Username **taken ya invalid** ho to wo channel nahi banega,\n"
-        "  baaki banenge.\n"
+        "**STEP 1/2 — Pehle channel ka NAAM bhejo**\n"
+        "Ye naam **sab 10 channels me ek hi dikhega**, jaise:\n"
+        "`Dholu Bholu Kids`\n\n"
+        "Uske baad STEP 2 me 10 username poochhunga, jo **alag-alag** honge\n"
+        "aur wahi har channel ka link banenge.\n"
+        "Jaise naam `Dholu Bholu Kids` + username `dholu1`, `dholu2` ho to\n"
+        "dono channel ka naam `Dholu Bholu Kids` dikhega, link alag hoga.\n\n"
         "• Channel **tumhare login account se** banega (bot se channel\n"
         "  nahi banta, isliye `/login` zaroori hai), aur tum hi uske owner hoge.\n"
-        "• Har channel ke beech **2 MIN ka gap** hai — ek channel banega, phir 2 min timer, phir second, aise hi. 10 channel me ~18 min + create time lagega, isliye beech me bot ko mat roko, warna bache hue ruk jayenge (jo ban gaye wo saved rahenge).\n"
+        "• Har channel ke beech **2 MIN ka gap** hai — 10 channel me ~18 min + create time lagega.\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -4638,7 +4663,7 @@ async def mychannels_handler(client, message):
         return
     txt = f"📢 **Tumhare channels: `{len(channels)}`**\n"
     for c in channels:
-        txt += f"\n• @{c.get('username', '?')} — {c.get('link', '')}"
+        txt += f"\n• {c.get('title', c.get('username', '?'))} — @{c.get('username', '?')} — {c.get('link', '')}"
     txt += ("\n\nIn sab me ek message bhejne ke liye: kisi message par reply "
             "karke `/sendall` likho, ya `/sendall` likh ke agla message bhejo.")
     await message.reply_text(txt, parse_mode=enums.ParseMode.MARKDOWN)
@@ -5546,8 +5571,28 @@ async def message_dispatcher(client, message):
         await run_clone(client, user_id, src_chat, status_msg)
         return
 
-    # Mkchannels flow: username ka jawab aa raha ho
+    # Mkchannels flow: pehle naam, phir username (v63 — naam ek hi, username alag)
     if user_id in MKCHANNELS_STATES:
+        _mk_step = MKCHANNELS_STATES[user_id].get("step")
+        if _mk_step == "WAITING_NAME":
+            title = text.strip()[:128]
+            if not title:
+                await message.reply_text("❌ Naam khaali hai. Channel ka naam dobara bhejo, jaise `Dholu Bholu Kids`.")
+                return
+            MKCHANNELS_STATES[user_id] = {"step": "WAITING_USERNAMES", "title": title}
+            await message.reply_text(
+                f"**📢 Naam locked: `{title}`**\n\n"
+                "**STEP 2/2 — Ab 10 username bhejo — ek hi message me,**\n"
+                "har username ek nayi line par, ya comma se alag karke.\n"
+                "Jaise:\n`myfirstchannel`\n`mysecondchannel`\n\n"
+                f"• **Sab channels ka naam ek hi hoga:** `{title}`\n"
+                "• Sirf **username alag-alag** hoga.\n"
+                "• Ek run me **max 10** username, har channel ke beech **2 MIN ka gap** hai.\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        _mk_title = MKCHANNELS_STATES[user_id].get("title")
         raw_names = _mk_split_raw(text)
         usernames = _mk_parse_usernames(text)
         if not usernames:
@@ -5563,7 +5608,7 @@ async def message_dispatcher(client, message):
         status_msg = await message.reply_text(
             f"📢 **Mkchannels Started!**\nUsernames: `{len(usernames)}` — ek-ek karke public channel bana raha hun...\n"
             f"⏱️ Har channel ke beech 2 min ka gap hai, isliye poora kaam ~`{(len(usernames) - 1) * 2}` min tak chal sakta hai. Beech me `/cancel` kar sakte ho.")
-        await run_mkchannels(client, user_id, usernames, status_msg)
+        await run_mkchannels(client, user_id, usernames, status_msg, title=_mk_title)
         if skipped:
             await message.reply_text(
                 "⚠️ Ye username invalid the, isliye skip kiye:\n" +
@@ -5920,6 +5965,7 @@ UPDATE_NOTES = (
     "• /mychannels aur /sendall — ek message sab channels me bhejo\n"
     "• /addchannel — pehle se bana channel bhi broadcast list me jodo\n"
     "• /sendallrange — pehli-aakhri link se 50 message tak sab channels me ek saath\n"
+    "• /mkchannels — ab 10 channels ka naam ek hi hoga, sirf username alag-alag hoga\n"
 )
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
