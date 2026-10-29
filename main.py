@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v55"
+VERSION = "v56"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2421,6 +2421,273 @@ async def run_create(client, uid, group_name, topics, status_msg):
     await message_reply(status_msg, done_text)
 
 
+# --- v56 ORGANIZE: naam samajh ke folder banao, us naam wali saari cheezein
+# us folder me COPY karo (DELETE KUCH NAHI) — text, photo, video, pdf, sab.
+# User ne manga (2026-10-29):
+# - "delete kch nhi krna bss folder name create kr k usme v bhej de
+#    wo text ho ya video ya pic"
+# - "topic name samaj ayga usi name se folder bna k usmr usname se
+#    jitne v pdf text vdo h bhej de systemattically"
+# Matlab: ek item ka folder uske naam se samjha jayega, aur usi naam wali
+# SAARI items (chahe pdf ho, text ho, video ho, pic ho) ek hi folder me,
+# systematically (har folder ke andar oldest-first order me) copy hongi.
+# Original message WAHI rahega jahan tha — koi delete, koi move nahi,
+# sirf ek extra copy folder me jayegi. Isliye ye safe hai: galat folder
+# bhi ban jaye to original khoega nahi, bas ek extra copy galat jagah
+# hogi, jo delete karke dobara chalaya ja sakta hai.
+# Design (v48 /clone ke hi verified tareeke par):
+# - Source group ka link private chat me /organize se diya jata hai
+#   (bot ko group me add karne ki zaroorat nahi — bot purani history
+#   waise bhi nahi padh sakta, /login wala account hi history padhega,
+#   jaise /clone karta hai).
+# - Topics userbot se banenge (_clone_create_topic reuse) — bot se topic
+#   banane par BOT_METHOD_INVALID aata hai.
+# - Agar us naam ka folder (topic) group me pehle se hai to wahi reuse
+#   hoga, duplicate folder nahi banega (_clone_list_topics se map).
+# - Copy /clone jaisa hi hai: text -> _clone_send_text, media ->
+#   download_file + _raw_send_to_topic. Isliye text, photo, video,
+#   document (pdf), audio, animation — jo _info_from_msg samajhta hai,
+#   wo sab chalega. 2 GB se badi file "too_big" hogi, fail list me jayegi.
+# TOPIC NAAM KAISE SAMJHA JAYEGA (_organize_topic_name):
+# - File ka naam (extension hata ke), ya caption, ya text ki pehli line
+#   li jati hai. "_" aur "-" ko space mana jata hai.
+# - "Chapter / Lecture / Part / Unit / Lesson / Notes" jaise shabdon se
+#   PEHLE wala hissa hi topic hai. Jaise:
+#       "Maths Chapter 1.pdf"      -> "Maths"
+#       "Physics Lecture 3.mp4"    -> "Physics"
+#       "Hindi Grammar Notes.pdf"  -> "Hindi Grammar"
+#       "Class 10 Maths Ch 1.pdf"  -> "Maths" (Class + number aage se hata)
+# - Aisa koi shabd na ho to pehla meaningful shabd hi topic hai:
+#       "Biology Cell.jpg" -> "Biology", "Chemistry.pdf" -> "Chemistry"
+# - Naam me koi subject na mile (jaise sirf "Chapter 1.pdf", "Notes.pdf",
+#   "Hello friends...") to "Unsorted" folder me jayega, taaki koi item
+#   khoye nahi, aur baad me haath se sahi folder me bheja ja sake.
+# - Grouping case-insensitive hai ("maths" aur "Maths" ek hi folder),
+#   par folder ka naam pehli baar mile hue naam jaisa hi rakha jayega.
+ORGANIZE_STATES = {}  # uid -> {"step": "WAITING_LINK"}
+ORGANIZE_ACTIVE = {}  # uid -> asyncio.Event (cancel flag, /cancel se set hota hai)
+ORGANIZE_STOP_WORDS = {
+    "chapter", "ch", "lecture", "lec", "part", "unit", "lesson", "lessons",
+    "notes", "note", "video", "videos", "pdf", "file", "topic", "section",
+    "module", "class", "std", "standard",
+}
+ORGANIZE_GENERIC_FIRST = {
+    "chapter", "ch", "lecture", "lec", "part", "unit", "lesson", "notes",
+    "note", "hello", "hi", "dear", "friends", "please", "the", "a", "an",
+}
+
+
+def _organize_topic_name(raw_name):
+    """Kisi file/caption/text se topic naam samjho. Returns str, kabhi khali nahi."""
+    import os as _os, re as _re
+    if not raw_name:
+        return "Unsorted"
+    # Sirf pehli line, extension hatao, _/- ko space banao
+    text = str(raw_name).splitlines()[0].strip()
+    text = _os.path.splitext(_os.path.basename(text))[0]
+    text = _re.sub(r"[_\-]+", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "Unsorted"
+    words = text.split(" ")
+    # Aage se "Class 10" / "Std 12" hatao
+    if len(words) >= 2 and words[0].lower() in ("class", "std", "standard") and words[1].isdigit():
+        words = words[2:]
+    if not words:
+        return "Unsorted"
+    # Stop word se pehle wala hissa hi topic hai (jaise "Hindi Grammar"
+    # Notes -> "Hindi Grammar"). Koi stop word na ho to sirf pehla
+    # meaningful shabd hi topic hai (jaise "Biology Cell" -> "Biology"),
+    # warna har file ka apna alag folder ban jayega.
+    topic_words = []
+    found_stop = False
+    for w in words:
+        if w.lower().strip(".,:") in ORGANIZE_STOP_WORDS:
+            found_stop = True
+            break
+        topic_words.append(w)
+    if not found_stop:
+        topic_words = topic_words[:1]
+    else:
+        topic_words = topic_words[:3]
+    if not topic_words:
+        # Pehla shabd hi generic hai, to doosra meaningful shabd dekho;
+        # sirf number bacha ho (jaise "Chapter 1") to Unsorted hai.
+        rest = [w for w in words
+                if w.lower().strip(".,:") not in ORGANIZE_GENERIC_FIRST
+                and not w.isdigit()]
+        if rest:
+            topic_words = [rest[0]]
+        else:
+            return "Unsorted"
+    topic = " ".join(topic_words).strip()
+    if not topic or topic.lower() in ORGANIZE_GENERIC_FIRST:
+        return "Unsorted"
+    # Display: har shabd ka pehla akshar bada, baaki jaisa hai waisa
+    topic = " ".join(w[:1].upper() + w[1:] if w else w for w in topic.split(" "))
+    return topic[:100]
+
+
+def _organize_name_for_msg(msg, info):
+    """Ek message ke liye topic samajhne wali string nikalo:
+    pehle file_name, phir caption, phir text ki pehli line."""
+    if info:
+        fname = (info.get("file_name") or "").strip()
+        if fname and not fname.startswith("media_"):
+            return fname
+        cap = (info.get("caption") or "").strip()
+        if cap:
+            return cap
+        if info.get("kind") == "text" and info.get("text"):
+            return info["text"]
+    if getattr(msg, "caption", None):
+        return msg.caption
+    if getattr(msg, "text", None):
+        return msg.text
+    return ""
+
+
+async def run_organize(client, uid, src_chat, status_msg):
+    """Source group ki history padho -> naam se topic samjho -> folder banao
+    (ya pehle wala reuse karo) -> har item ki ek COPY us folder me bhejo.
+    DELETE KUCH NAHI HOTA — original message jahan tha wahi rahega."""
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — group ki history tumhare "
+                            "account se padhi jayegi, isliye login session zaroori hai.")
+        return
+    cancel_event = asyncio.Event()
+    ORGANIZE_ACTIVE[uid] = cancel_event
+    try:
+        try:
+            src = await userbot.get_chat(src_chat)
+            src_title = getattr(src, "title", None) or str(src_chat)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Source group nahi khul raha: {e}\n"
+                                "Check karo ki tumhara account us group ka member hai.")
+            return
+        await safe_edit(status_msg, f"🔍 **Organize shuru:** `{src_title}`\nMessages nikal raha hun...")
+        # Pehle se maujood folders ka map (title lower -> topic_id)
+        try:
+            existing = await _clone_list_topics(userbot, src_chat)
+            topic_map = {ttitle.lower(): tid for tid, ttitle in (existing or [])}
+        except Exception:
+            topic_map = {}
+        # Saari history ek baar me group karo, topic naam ke hisaab se
+        buckets = {}  # topic_key_lower -> {"name": display, "msgs": [msg, ...]}
+        try:
+            async for msg in userbot.get_chat_history(src_chat):
+                if cancel_event.is_set():
+                    break
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                info = _info_from_msg(msg, msg.id)
+                if info is None:
+                    continue
+                # Target topic: naam se samjho
+                orig_tid = _clone_topic_key(msg)
+                tname = _organize_topic_name(_organize_name_for_msg(msg, info))
+                # Agar message pehle se kisi topic me hai aur us topic ka naam
+                # hi target hai, to copy ki zaroorat nahi (pehle se sahi jagah).
+                if orig_tid != 1 and existing:
+                    orig_title = dict((tid, t) for tid, t in existing).get(orig_tid)
+                    if orig_title and orig_title.lower() == tname.lower():
+                        continue
+                key = tname.lower()
+                buckets.setdefault(key, {"name": tname, "msgs": []}).append(msg)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
+            return
+        total = sum(len(v["msgs"]) for v in buckets.values())
+        await safe_edit(status_msg, f"📂 **Topics mile:** `{len(buckets)}`\n"
+                        f"Items: `{total}` — folders bana raha hun (copy, delete nahi)...")
+        dest_peer = await userbot.resolve_peer(src_chat)
+        copied = failed = skipped = 0
+        folder_report = []
+        for key in sorted(buckets.keys()):
+            if cancel_event.is_set():
+                break
+            b = buckets[key]
+            tname = b["name"]
+            # Folder banao ya pehle wala reuse karo
+            dest_tid = topic_map.get(key)
+            is_new = False
+            if not dest_tid:
+                try:
+                    dest_tid = await _clone_create_topic(userbot, src_chat, tname)
+                except Exception as e:
+                    print(f"[ORGANIZE] folder fail '{tname}': {e}", flush=True)
+                    dest_tid = None
+                if dest_tid:
+                    topic_map[key] = dest_tid
+                    is_new = True
+            if not dest_tid:
+                failed += len(b["msgs"])
+                folder_report.append(f"• {tname}: ❌ folder nahi bana ({len(b['msgs'])} fail)")
+                continue
+            f_copied = f_failed = 0
+            await safe_edit(status_msg, f"📂 **Folder:** `{tname}` ({'naya' if is_new else 'pehle se tha'})\n"
+                            f"Copy ho raha hai... (total ab tak: ✅ {copied} | ❌ {failed})")
+            for m in reversed(b["msgs"]):  # oldest-first = folder ke andar sahi order
+                if cancel_event.is_set():
+                    break
+                if not m.media and not m.text:
+                    skipped += 1
+                    continue
+                info = _info_from_msg(m, m.id)
+                if info is None:
+                    skipped += 1
+                    continue
+                if info.get("kind") == "too_big":
+                    failed += 1
+                    f_failed += 1
+                    continue
+                if info.get("kind") == "text":
+                    if await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]):
+                        copied += 1
+                        f_copied += 1
+                    else:
+                        failed += 1
+                        f_failed += 1
+                    continue
+                fp = await download_file(userbot, info, None, None, uid, client)
+                if not fp:
+                    failed += 1
+                    f_failed += 1
+                    if info.get("tmpdir"):
+                        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                    continue
+                ok = await _raw_send_to_topic(
+                    userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
+                    caption=info.get("caption") or "", info=info)
+                if info.get("tmpdir"):
+                    shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                if ok:
+                    copied += 1
+                    f_copied += 1
+                else:
+                    failed += 1
+                    f_failed += 1
+                await asyncio.sleep(2)
+            folder_report.append(f"• {tname}: ✅ {f_copied} | ❌ {f_failed}")
+            if cancel_event.is_set():
+                break
+        done_text = ("✅ **Organize complete!**\n"
+                     f"📦 Group: `{src_title}`\n"
+                     f"📂 Folders: `{len(buckets)}`\n"
+                     f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`\n"
+                     "🛡️ **Delete kuch nahi hua** — original messages wahi hain, "
+                     "sirf ek extra copy folder me gayi hai.")
+        if folder_report:
+            done_text += "\n" + "\n".join(folder_report)
+        if cancel_event.is_set():
+            done_text = "🛑 **Organize stopped.**\n" + done_text
+        await safe_edit(status_msg, done_text)
+        await message_reply(status_msg, done_text)
+    finally:
+        ORGANIZE_ACTIVE.pop(uid, None)
+
+
 async def run_clone(client, uid, src_chat, status_msg):
     """Poora clone: topics nikalo -> naya private group -> same folders ->
     har folder ki saari messages (oldest-first) copy karo. Sequential, ek-ek karke."""
@@ -2731,6 +2998,7 @@ COMMANDS_TEXT = (
     "`/public` — Public channel fast copy\n"
     "`/clone` — Clone group folders\n"
     "`/create` — Naya group + folders banao\n"
+    "`/organize` — Naam se folder + copy (no delete)\n"
     "`/settings` — Rename, caption, watermark\n"
     "`/plan` — Your plan\n"
     "`/buy` — Premium\n"
@@ -2871,6 +3139,13 @@ async def cancel_handler(client, message):
         hit = True
     if uid in CREATE_STATES:
         CREATE_STATES.pop(uid, None)
+        hit = True
+    if uid in ORGANIZE_STATES:
+        ORGANIZE_STATES.pop(uid, None)
+        hit = True
+    ev = ORGANIZE_ACTIVE.get(uid)
+    if ev is not None:
+        ev.set()
         hit = True
     ev = ACTIVE_BATCHES.get(uid)
     if ev is not None:
@@ -3112,6 +3387,36 @@ async def create_start_handler(client, message):
         "phir un saare naam se folders ban jayenge.\n\n"
         "Naya **private** group tumhare account se banega\n"
         "(bot se group nahi banta, isliye `/login` zaroori hai).\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("organize") & filters.private)
+async def organize_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"⚡ Processing /organize for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    CREATE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
+    ORGANIZE_STATES[message.chat.id] = {"step": "WAITING_LINK"}
+    await message.reply_text(
+        "**📂 VILLAN ORGANIZE — naam se folder, copy, NO DELETE**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**Source group ka link bhejo**\n"
+        "(jiske pdf / text / video / pic ko folders me bhejna hai).\n\n"
+        "Bot naam padh ke topic samjhega, us naam ka folder banayega\n"
+        "(pehle se ho to wahi use karega), aur us naam wali saari\n"
+        "cheezein us folder me **COPY** kar dega — **original delete\n"
+        "nahi hoga, wahi rahega.**\n\n"
+        "Jaise: `Maths Chapter 1.pdf` -> `Maths` folder,\n"
+        "`Physics Lecture 3.mp4` -> `Physics` folder.\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -3867,6 +4172,21 @@ async def message_dispatcher(client, message):
             await run_create(client, user_id, group_name, topics, status_msg)
             return
 
+    # Organize flow: group link ka jawab aa raha ho
+    if user_id in ORGANIZE_STATES and ORGANIZE_STATES[user_id].get("step") == "WAITING_LINK":
+        src_chat = _clone_parse_link(text)
+        if src_chat is None:
+            await message.reply_text("❌ **Invalid link!** Source group ka link bhejo "
+                                     "(jaise `https://t.me/c/1234567890` ya `@groupname`).")
+            return
+        ORGANIZE_STATES.pop(user_id, None)
+        status_msg = await message.reply_text(
+            "📂 **Organize Started!** Naam padh ke folders bana raha hun, "
+            "phir saari cheezein un folders me copy karunga (delete nahi)..."
+        )
+        await run_organize(client, user_id, src_chat, status_msg)
+        return
+
     if (
         user_id in PUBLIC_STATES
         and PUBLIC_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -4089,6 +4409,7 @@ async def main():
             BotCommand("public", "Public channel fast copy"),
             BotCommand("clone", "Group folders clone karo"),
             BotCommand("create", "Naya group + folders banao"),
+            BotCommand("organize", "Naam se folder + copy (no delete)"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
             BotCommand("buy", "Premium kharido"),
