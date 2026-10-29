@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v57"
+VERSION = "v58"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -78,6 +78,7 @@ UPDATES_CHANNEL = os.environ.get("UPDATES_CHANNEL", "").strip()
 # v35: /start welcome photo ka URL ya Telegram file_id. Khali = bina photo ke welcome.
 START_IMAGE = os.environ.get("START_IMAGE", "").strip()
 TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(DATA_DIR, "user_topics.json"))
+BATCH_RESUME_FILE = os.path.join(DATA_DIR, "batch_resume.json")
 # Ek batch me max kitne posts (default 1000; Koyeb env me BATCH_LIMIT se badlo)
 BATCH_LIMIT = max(1, int(os.environ.get("BATCH_LIMIT", "1000")))
 # v40 SPEED: file delivery pacing. Fast path (file_id/copy, instant) ke baad
@@ -176,6 +177,7 @@ async def _backup_restore_all():
         "subscriptions.json": SUBS_FILE,
         "user_settings.json": SETTINGS_FILE,
         "user_topics.json": TOPICS_FILE,
+        "batch_resume.json": BATCH_RESUME_FILE,
     }
     for fname, path in stores.items():
         try:
@@ -1317,7 +1319,7 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
 # Pyrogram 2.0.106 ke high-level send_* me top_msg_id nahi hai, isliye
 # forum topic me bhejne ke liye raw messages.SendMedia use karna padta hai.
 async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
-                             file_path=None, caption="", info=None, thumb=None):
+                             file_path=None, caption="", info=None, thumb=None, prog_msg=None):
     """Topic me media bhejo (raw API, top_msg_id se).
     file_id diya to server-side instant, file_path diya to upload karke.
     Returns True/False."""
@@ -1343,8 +1345,16 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                         access_hash=fid.access_hash,
                         file_reference=fid.file_reference or b""))
         elif file_path and os.path.exists(file_path):
-            # file upload karo
-            uploaded = await client.save_file(file_path)
+            if prog_msg is not None:
+                _up_start = time.time()
+                _up_last = [time.time()]
+                uploaded = await client.save_file(
+                    file_path, progress=progress_bar,
+                    progress_args=(
+                        prog_msg, _up_start, _up_last,
+                        f"🚀 Uploading • ID `{info.get('msg_id')}`"))
+            else:
+                uploaded = await client.save_file(file_path)
             mime, _ = mimetypes.guess_type(file_path)
             mime = mime or "application/octet-stream"
             fname = os.path.basename(file_path)
@@ -1442,6 +1452,25 @@ async def _botapi_create_topic(title):
         print(f"[TOPIC] createForumTopic failed: {result}", flush=True)
     except Exception as e:
         print(f"[TOPIC] createForumTopic exception: {e}", flush=True)
+    return None
+
+
+async def _botapi_create_topic_for_chat(chat_id, title):
+    if not BOT_TOKEN or not chat_id:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic"
+        data = {"chat_id": str(chat_id), "name": (title or "Folder")[:100]}
+        sess = await _http()
+        async with sess.post(url, data=data, timeout=30) as resp:
+            result = await resp.json()
+        if result.get("ok"):
+            tid = result["result"].get("message_thread_id")
+            print(f"[FBATCH] Bot API se topic banaya: {tid} in {chat_id}", flush=True)
+            return tid
+        print(f"[FBATCH] Bot API topic fail: {result}", flush=True)
+    except Exception as e:
+        print(f"[FBATCH] Bot API topic exception: {e}", flush=True)
     return None
 
 
@@ -1915,6 +1944,95 @@ async def _archive_source_link(client, topic_id, src_chat, start_id, end_id, own
         return False
 
 
+# --- v58 RESUME: batch rukne par wahi se dobara shuru ---
+# "jha se batch ruka" — resume hamesha aakhri COMPLETE hui file ke BAAD
+# wali ID se shuru hoga, pehli file se nahi. Har file complete hone par
+# batch_resume.json me last_done_id save hota hai (local file, har file
+# par backup channel spam nahi hota — backup sirf batch rukne/poora hone
+# par ek baar upload hota hai, taaki redeploy ke baad bhi resume mile
+# agar backup channel set hai).
+# Failed/offline files bhi "attempted" gini jati hain — resume unhe
+# dobara nahi bhejega, sirf aage ki unattempted files bhejega.
+_RESUME_LOCK = set()
+
+
+def _batch_save_progress(uid, src_chat, start_id, end_id, last_done_id, public_fast=False):
+    try:
+        data = _load_json(BATCH_RESUME_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        data[str(uid)] = {
+            "src_chat": src_chat, "start_id": start_id, "end_id": end_id,
+            "last_done_id": last_done_id, "public_fast": bool(public_fast),
+        }
+        _save_json(BATCH_RESUME_FILE, data)
+    except Exception as e:
+        print(f"[RESUME] save fail: {e}", flush=True)
+
+
+def _batch_get_progress(uid):
+    try:
+        data = _load_json(BATCH_RESUME_FILE, {})
+        if isinstance(data, dict):
+            entry = data.get(str(uid))
+            if isinstance(entry, dict) and "last_done_id" in entry and "end_id" in entry:
+                return entry
+    except Exception:
+        pass
+    return None
+
+
+def _batch_clear_progress(uid):
+    try:
+        data = _load_json(BATCH_RESUME_FILE, {})
+        if isinstance(data, dict) and str(uid) in data:
+            data.pop(str(uid), None)
+            _save_json(BATCH_RESUME_FILE, data)
+    except Exception:
+        pass
+
+
+async def _handle_resume(client, uid, trigger_msg):
+    """Resume button / /resume — ruka hua batch wahi se dobara shuru karo."""
+    if not _is_allowed(uid):
+        await client.send_message(uid, "⛔ Access denied.")
+        return
+    if trigger_msg is not None:
+        try:
+            if not await _has_joined(uid, force=True):
+                await _send_join_wall(trigger_msg)
+                return
+        except Exception:
+            pass
+    if uid in ACTIVE_BATCHES or uid in _RESUME_LOCK:
+        await client.send_message(uid, "⚠️ Batch pehle se chal raha hai, resume nahi kar sakte.")
+        return
+    entry = _batch_get_progress(uid)
+    if not entry:
+        await client.send_message(uid, "❌ Koi ruka hua batch nahi mila. Naya batch chalane ke liye `/batch` ya `/public` use karo.")
+        return
+    src_chat = entry.get("src_chat")
+    end_id = entry.get("end_id")
+    last_done = entry.get("last_done_id")
+    public_fast = entry.get("public_fast", False)
+    next_id = (last_done + 1) if isinstance(last_done, int) else None
+    if next_id is None or next_id > end_id:
+        _batch_clear_progress(uid)
+        await client.send_message(uid, "✅ Ye batch pehle hi poora ho gaya tha, resume karne ko kuch nahi bacha.")
+        return
+    _RESUME_LOCK.add(uid)
+    try:
+        if trigger_msg is not None:
+            status_msg = await trigger_msg.reply_text(
+                f"▶️ **Batch resumed!**\n`{next_id}` se `{end_id}` tak, bacha hua `{end_id - next_id + 1}` items.")
+        else:
+            status_msg = await client.send_message(
+                uid, f"▶️ **Batch resumed!**\n`{next_id}` se `{end_id}` tak.")
+        await run_batch(client, uid, src_chat, next_id, end_id, status_msg, public_fast=public_fast)
+    finally:
+        _RESUME_LOCK.discard(uid)
+
+
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, public_fast=False):
     # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
     # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
@@ -1937,6 +2055,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
 
     ids = list(range(start_id, end_id + 1))
     total = len(ids)
+    _batch_save_progress(owner_id, src_chat, start_id, end_id, start_id - 1, public_fast)
     # v51: naya batch purane batch ko rok de. Pehle purana batch chalta
     # rehta tha (cancel event overwrite ho jata tha) aur badi file ka
     # download bandwidth khata rehta tha, jisse naye batch ki download
@@ -2083,6 +2202,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     async with stats.lock:
                         stats.done += 1
                         stats.fail += 1
+                    _batch_save_progress(owner_id, src_chat, start_id, end_id, mid, public_fast)
                     await _update_batch_status(status_msg, stats)
                     continue
                 # HAR FILE ke liye NAYA progress message (neeche se aayega)
@@ -2132,6 +2252,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         stats.ok += 1
                     else:
                         stats.fail += 1
+                _batch_save_progress(owner_id, src_chat, start_id, end_id, mid, public_fast)
                 # Pinned status live update (max 3 sec me 1 baar)
                 await _update_batch_status(status_msg, stats)
                 # v50 PACING: PRIVATE batch me 10s countdown gap, PUBLIC par nahi.
@@ -2182,8 +2303,39 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
     if cancel_event.is_set() and (done < total):
-        await safe_edit(status_msg, "🛑 Batch stopped.")
+        # Ruka hua batch: resume entry rakho, backup ek baar upload karo,
+        # aur RESUME BUTTON wala message bhejo (pinned status par button
+        # safe_edit se nahi lagta, isliye alag message hai).
+        _entry = _batch_get_progress(owner_id)
+        _last = _entry.get("last_done_id") if _entry else None
+        if not isinstance(_last, int):
+            _last = (start_id + done - 1) if done > 0 else (start_id - 1)
+            _batch_save_progress(owner_id, src_chat, start_id, end_id, _last, public_fast)
+        _next = _last + 1
+        try:
+            await _backup_upload("batch_resume.json", BATCH_RESUME_FILE)
+        except Exception:
+            pass
+        await safe_edit(status_msg, f"🛑 Batch stopped.\nDone: `{done}` / `{total}`\nNext: `{_next}` se resume hoga.")
+        try:
+            await client.send_message(
+                owner_id,
+                f"🛑 **Batch ruk gaya hai.**\n"
+                f"Done: `{done}` / `{total}` (Success: `{ok}` | Failed: `{fail}`)\n"
+                f"**Resume `{_next}` se `{end_id}` tak hoga** — pehli file se nahi, wahi se jahan ruka tha.\n\n"
+                "Resume karne ke liye neeche wala button dabao, ya `/resume` likho.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("▶️ Resume Batch", callback_data="resume_batch")
+                ]]),
+            )
+        except Exception as e:
+            print(f"[RESUME] button message fail: {e}", flush=True)
     else:
+        _batch_clear_progress(owner_id)
+        try:
+            await _backup_upload("batch_resume.json", BATCH_RESUME_FILE)
+        except Exception:
+            pass
         await safe_edit(
             status_msg,
             f"✅ Batch complete\nSuccess: `{ok}` | Failed: `{fail}`",
@@ -2924,6 +3076,269 @@ async def run_arrange(client, uid, src_chat, dest_chat, status_msg):
         ARRANGE_ACTIVE.pop(uid, None)
 
 
+# --- v58 FBATCH: folderwise batch — /organize + /arrange ki jagah ek hi command ---
+# User ne manga (2026-10-29):
+# - "command ko fbatch name dedo, organise or arrange hata do, jb v
+#   folderwise batch niklna hoga fbatch use kr lunga"
+# - "isme destination m bss bot admin rhega to chalega n" -> HAAN, chalega,
+#   isliye fbatch ka dest kaam BOT se hota hai: folder Bot API
+#   createForumTopic se banega (bot ko dest me admin hona chahiye), upload
+#   BOT client se hoga. Userbot ko dest me hona zaroori nahi hai.
+#   Agar bot se fail ho to fallback me userbot se try kiya jayega.
+#   Shart: bot se pehle se bane folders ki list nahi milti, isliye sirf
+#   bot-admin wale dest me dobara fbatch chalane par duplicate folder ban
+#   sakta hai. Bachne ke liye dest me login account ko sirf MEMBER bana
+#   do (admin zaroori nahi) — tab folders reuse honge.
+# - "jise upload show keta h waise isme v upload show krna chaiye" ->
+#   har media file par private chat me per-file progress message banega,
+#   jaise /batch me hota hai: pehle DOWNLOADING bar, phir UPLOADING bar.
+# Flow: /fbatch -> SOURCE link -> DEST link -> process start.
+# Baaki /arrange jaisa hi hai: naam se topic samjho, dest me folder, har
+# folder ke andar oldest-first, sequencewise COPY, DELETE KUCH NAHI.
+FBATCH_STATES = {}
+FBATCH_ACTIVE = {}
+FBATCH_TOPICS_FILE = "fbatch_topics.json"
+
+
+def _fbatch_load_topics():
+    try:
+        data = _load_json(FBATCH_TOPICS_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fbatch_save_topics(mapping):
+    try:
+        _save_json(FBATCH_TOPICS_FILE, mapping)
+    except Exception as e:
+        print(f"[FBATCH] topics save fail: {e}", flush=True)
+
+
+async def _fbatch_create_topic(bot_client, userbot, dest_id, title):
+    tid = await _botapi_create_topic_for_chat(dest_id, title)
+    if tid:
+        return tid
+    if userbot:
+        try:
+            tid = await _clone_create_topic(userbot, dest_id, title)
+            if tid:
+                return tid
+        except Exception as e:
+            print(f"[FBATCH] userbot topic fail '{title}': {e}", flush=True)
+    return None
+
+
+async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — source ki history aur download tumhare account se honge.")
+        return
+    cancel_event = asyncio.Event()
+    FBATCH_ACTIVE[uid] = cancel_event
+    try:
+        try:
+            src = await _get_chat_maybe_invite(userbot, src_chat)
+            src_title = getattr(src, "title", None) or str(src_chat)
+            if getattr(src, "id", None):
+                src_chat = src.id
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Source group/channel nahi khul raha: {e}\nCheck karo ki tumhara account uska member hai.")
+            return
+        dest = None
+        try:
+            dest = await _get_chat_maybe_invite(userbot, dest_chat)
+            dest_title = getattr(dest, "title", None) or str(dest_chat)
+            if getattr(dest, "id", None):
+                dest_chat = dest.id
+        except Exception:
+            dest_title = str(dest_chat)
+            if isinstance(dest_chat, str) and dest_chat.lstrip("-").isdigit():
+                dest_chat = int(dest_chat)
+        is_forum = getattr(dest, "is_forum", None) if dest else None
+        if is_forum is False:
+            await message_reply(status_msg, "❌ **Dest group forum nahi hai!**\nDest group ki Settings me jaake **Topics ON** karo, phir dobara `/fbatch` chalao. Tab tak kuch copy nahi hua hai.")
+            return
+        await safe_edit(status_msg, f"🔍 **Fbatch shuru:**\nSource: `{src_title}`\nDest: `{dest_title}`\nMessages nikal raha hun...")
+        topic_map = {}
+        userbot_in_dest = False
+        try:
+            existing = await _clone_list_topics(userbot, dest_chat)
+            if existing is not None:
+                topic_map = {ttitle.lower(): tid for tid, ttitle in existing}
+                userbot_in_dest = True
+        except Exception:
+            topic_map = {}
+        saved_map = _fbatch_load_topics()
+        dest_key = str(dest_chat)
+        if dest_key in saved_map and isinstance(saved_map[dest_key], dict):
+            for k, v in saved_map[dest_key].items():
+                topic_map.setdefault(k.lower(), v)
+        buckets = {}
+        try:
+            async for msg in userbot.get_chat_history(src_chat):
+                if cancel_event.is_set():
+                    break
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                info = _info_from_msg(msg, msg.id)
+                if info is None:
+                    continue
+                tname = _organize_topic_name(_organize_name_for_msg(msg, info))
+                key = tname.lower()
+                buckets.setdefault(key, {"name": tname, "msgs": []})["msgs"].append(msg)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
+            return
+        total = sum(len(v["msgs"]) for v in buckets.values())
+        await safe_edit(status_msg, f"📂 **Topics mile:** `{len(buckets)}`\nItems: `{total}` — dest me folders bana raha hun...")
+        dest_peer = None
+        try:
+            dest_peer = await client.resolve_peer(dest_chat)
+        except Exception:
+            try:
+                dest_peer = await userbot.resolve_peer(dest_chat)
+            except Exception as e:
+                await message_reply(status_msg, f"❌ Dest group resolve nahi hua: {e}\nCheck karo ki bot dest me admin hai.")
+                return
+        copied = failed = skipped = 0
+        folder_report = []
+        for key in sorted(buckets.keys()):
+            if cancel_event.is_set():
+                break
+            b = buckets[key]
+            tname = b["name"]
+            dest_tid = topic_map.get(key)
+            is_new = False
+            if not dest_tid:
+                dest_tid = await _fbatch_create_topic(client, userbot, dest_chat, tname)
+                if dest_tid:
+                    topic_map[key] = dest_tid
+                    is_new = True
+                    saved_map.setdefault(dest_key, {})[key] = dest_tid
+                    _fbatch_save_topics(saved_map)
+            if not dest_tid:
+                failed += len(b["msgs"])
+                folder_report.append(f"• {tname}: ❌ folder nahi bana ({len(b['msgs'])} fail)")
+                continue
+            f_copied = f_failed = 0
+            await safe_edit(status_msg, f"📂 **Folder:** `{tname}` ({'naya' if is_new else 'pehle se tha'})\nCopy ho raha hai... (total ab tak: ✅ {copied} | ❌ {failed})")
+            for m in reversed(b["msgs"]):
+                if cancel_event.is_set():
+                    break
+                if not m.media and not m.text:
+                    skipped += 1
+                    continue
+                info = _info_from_msg(m, m.id)
+                if info is None:
+                    skipped += 1
+                    continue
+                if info.get("kind") == "too_big":
+                    failed += 1
+                    f_failed += 1
+                    continue
+                if info.get("kind") == "text":
+                    sent = False
+                    try:
+                        from pyrogram import raw as _raw2
+                        import random as _rand2
+                        await client.invoke(_raw2.functions.messages.SendMessage(
+                            peer=dest_peer, message=info["text"],
+                            random_id=_rand2.randint(1, 2**63 - 1), top_msg_id=dest_tid))
+                        sent = True
+                    except Exception:
+                        sent = await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]) if userbot_in_dest else False
+                    if sent:
+                        copied += 1
+                        f_copied += 1
+                    else:
+                        failed += 1
+                        f_failed += 1
+                    continue
+                prog_msg = None
+                try:
+                    prog_msg = await status_msg.reply_text(
+                        f"📥 Downloading • ID `{m.id}` • {info.get('file_name', 'file')} -> `{tname}`")
+                except Exception:
+                    prog_msg = None
+                fp = await download_file(userbot, info, prog_msg, None, uid, client)
+                if not fp:
+                    failed += 1
+                    f_failed += 1
+                    if prog_msg:
+                        try:
+                            await safe_edit(prog_msg, f"❌ Download fail • ID `{m.id}`")
+                        except Exception:
+                            pass
+                    if info.get("tmpdir"):
+                        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                    continue
+                if prog_msg:
+                    try:
+                        await safe_edit(prog_msg, f"🚀 Uploading • ID `{m.id}` • {info.get('file_name', 'file')} -> `{tname}`")
+                    except Exception:
+                        pass
+                ok = await _raw_send_to_topic(
+                    client, dest_peer, dest_tid, info["kind"], file_path=fp,
+                    caption=info.get("caption") or "", info=info, prog_msg=prog_msg)
+                if not ok and userbot_in_dest:
+                    if prog_msg:
+                        try:
+                            await safe_edit(prog_msg, f"🚀 Uploading (userbot) • ID `{m.id}`")
+                        except Exception:
+                            pass
+                    ok = await _raw_send_to_topic(
+                        userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
+                        caption=info.get("caption") or "", info=info, prog_msg=prog_msg)
+                if info.get("tmpdir"):
+                    shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                if ok:
+                    copied += 1
+                    f_copied += 1
+                    if prog_msg:
+                        try:
+                            await safe_edit(prog_msg, f"✅ Copied • ID `{m.id}` • {info.get('file_name', 'file')} -> `{tname}`")
+                        except Exception:
+                            pass
+                else:
+                    failed += 1
+                    f_failed += 1
+                    if prog_msg:
+                        try:
+                            await safe_edit(prog_msg, f"❌ Upload fail • ID `{m.id}`")
+                        except Exception:
+                            pass
+                await asyncio.sleep(2)
+            folder_report.append(f"• {tname}: ✅ {f_copied} | ❌ {f_failed}")
+            if cancel_event.is_set():
+                break
+        invite = None
+        try:
+            from pyrogram import raw as _raw
+            inv = await client.invoke(_raw.functions.messages.ExportChatInvite(peer=dest_peer))
+            invite = getattr(inv, "link", None)
+        except Exception:
+            pass
+        done_text = ("✅ **Fbatch complete!**\n"
+                     f"📦 Source: `{src_title}`\n"
+                     f"📦 Dest: `{dest_title}`\n"
+                     f"📂 Folders: `{len(buckets)}`\n"
+                     f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`\n"
+                     "🛡️ **Delete kuch nahi hua** — source waisa ka waisa hai, sirf dest me copy gayi hai.")
+        if folder_report:
+            done_text += "\n" + "\n".join(folder_report)
+        if invite:
+            done_text += f"\n🔗 Dest invite: {invite}"
+        if not userbot_in_dest:
+            done_text += ("\n⚠️ Dest me sirf bot admin tha, isliye pehle se bane folders ki list nahi mili — dobara fbatch chalane par duplicate folder ban sakta hai. Duplicate se bachne ke liye dest me login account ko sirf member bana do (admin zaroori nahi).")
+        if cancel_event.is_set():
+            done_text = "🛑 **Fbatch stopped.**\n" + done_text
+        await safe_edit(status_msg, done_text)
+        await message_reply(status_msg, done_text)
+    finally:
+        FBATCH_ACTIVE.pop(uid, None)
+
+
 async def run_clone(client, uid, src_chat, status_msg):
     """Poora clone: topics nikalo -> naya private group -> same folders ->
     har folder ki saari messages (oldest-first) copy karo. Sequential, ek-ek karke."""
@@ -3234,8 +3649,8 @@ COMMANDS_TEXT = (
     "`/public` — Public channel fast copy\n"
     "`/clone` — Clone group folders\n"
     "`/create` — Naya group + folders banao\n"
-    "`/organize` — Naam se folder + copy (no delete)\n"
-    "`/arrange` — Source se dest, folder + sequencewise copy\n"
+    "`/fbatch` — Folderwise batch: source se dest, folder + sequencewise copy (no delete, progress ke saath)\n"
+    "`/resume` — Ruka hua batch wahi se dobara shuru karo (pehli file se nahi)\n"
     "`/settings` — Rename, caption, watermark\n"
     "`/plan` — Your plan\n"
     "`/buy` — Premium\n"
@@ -3358,6 +3773,12 @@ async def start_handler(client, message):
 
 
 
+@app.on_message(filters.command("resume") & filters.private)
+async def resume_start_handler(client, message):
+    print(f"⚡ Processing /resume for user {message.chat.id}", flush=True)
+    await _handle_resume(client, message.chat.id, message)
+
+
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(client, message):
     uid = message.chat.id
@@ -3388,6 +3809,13 @@ async def cancel_handler(client, message):
         ARRANGE_STATES.pop(uid, None)
         hit = True
     ev = ARRANGE_ACTIVE.get(uid)
+    if ev is not None:
+        ev.set()
+        hit = True
+    if uid in FBATCH_STATES:
+        FBATCH_STATES.pop(uid, None)
+        hit = True
+    ev = FBATCH_ACTIVE.get(uid)
     if ev is not None:
         ev.set()
         hit = True
@@ -3527,15 +3955,26 @@ async def plan_handler(client, message):
 async def help_handler(client, message):
     """Bot kaise use karein — poori guide."""
     help_text = (
-        "**VILLAN — Guide**\n\n"
-        "1. `/login` — Sign in with your number (OTP, then 2FA if set).\n"
-        "2. `/batch` — Send the first link, then the last link.\n"
-        "   Or send a range directly: `https://t.me/c/123456789/100-110`\n"
-        "3. Files arrive one by one.\n\n"
-        "`/settings` — Rename, caption, watermark\n"
-        "`/plan` — Your plan • `/buy` — Premium • `/cancel` — Stop\n\n"
+        "**VILLAN — Guide (sab commands ka use)**\n"
+        "\n"
+        "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
+        "2. /logout — Session khatam karo.\n"
+        "3. /batch — Bulk extraction: pehle pehli file ka link bhejo, phir aakhri file ka link bhejo. Ya seedha range bhejo: https://t.me/c/123456789/100-110\n"
+        "   Files ek-ek karke, sequencewise aayengi, har file par download + upload progress dikhega.\n"
+        "4. /public — Public channel ki fast copy: pehli link, phir aakhri link. Private link yahan nahi chalega, uske liye /batch use karo.\n"
+        "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya /batch chala diya, to resume latest batch ka hi hoga.\n"
+        "6. /clone — Kisi group ke folders + saari messages ko naye PRIVATE group me copy karo: source group ka link bhejo, naya group tumhare account se banega.\n"
+        "7. /create — Naya group banao: pehle group ka naam bhejo, phir topics ke naam ek hi message me (har naam ek line par, ya comma se) bhejo, un naam se folders ban jayenge.\n"
+        "8. /fbatch — Folderwise batch (yehi /organize aur /arrange ki jagah hai): pehle SOURCE group/channel ka link bhejo, phir DEST group ka link bhejo. Bot naam padh ke topic samjhega, dest me us naam ka folder banayega, aur us naam wali saari cheezein (pdf / text / video / pic) us folder me sequencewise COPY karega. Delete kuch nahi hoga, source waisa ka waisa rahega. Har file par download + upload progress dikhega, jaise /batch me dikhta hai. Dest me sirf bot admin ho to bhi chalega, par duplicate folder se bachne ke liye dest me login account ko sirf member bana do. Dest group me Topics ON hona chahiye.\n"
+        "9. /settings — Rename, caption template, word remove/replace, thumbnail, watermark, upload method badlo.\n"
+        "10. /plan — Apna plan dekho. /buy — Premium kharido (payment manual UPI hai).\n"
+        "11. /cancel — Chal raha kaam roko (batch, clone, create, fbatch — koi bhi). Batch rokne ke baad resume karne ke liye button ya /resume use karo.\n"
+        "\n"
+        "Seedha link bhejne par ek file ki copy hogi. /organize aur /arrange ab hata diye gaye hain — unki jagah /fbatch use karo.\n"
+        "\n"
         f"Owner: `{OWNER_USERNAME}`"
     )
+
     await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
 
 
@@ -3639,77 +4078,48 @@ async def create_start_handler(client, message):
 
 @app.on_message(filters.command("organize") & filters.private)
 async def organize_start_handler(client, message):
-    if not await _has_joined(message.chat.id, force=True):
-        await _send_join_wall(message)
-        return
-    if not _is_allowed(message.chat.id):
-        await message.reply_text("⛔ Access denied.")
-        return
-    print(f"⚡ Processing /organize for user {message.chat.id}", flush=True)
-    USER_STATES.pop(message.chat.id, None)
-    CLONE_STATES.pop(message.chat.id, None)
-    CREATE_STATES.pop(message.chat.id, None)
-    PUBLIC_STATES.pop(message.chat.id, None)
-    ORGANIZE_STATES[message.chat.id] = {"step": "WAITING_LINK"}
     await message.reply_text(
-        "**📂 VILLAN ORGANIZE — naam se folder, copy, NO DELETE**\n"
-        "**━━━━━━━━━━━━━━━**\n\n"
-        "**Source group ka link bhejo**\n"
-        "(jiske pdf / text / video / pic ko folders me bhejna hai).\n\n"
-        "Bot naam padh ke topic samjhega, us naam ka folder banayega\n"
-        "(pehle se ho to wahi use karega), aur us naam wali saari\n"
-        "cheezein us folder me **COPY** kar dega — **original delete\n"
-        "nahi hoga, wahi rahega.**\n\n"
-        "Jaise: `Maths Chapter 1.pdf` -> `Maths` folder,\n"
-        "`Physics Lecture 3.mp4` -> `Physics` folder.\n\n"
-        "**❌ Cancel:** `/cancel`",
+        "**⚠️ `/organize` hata diya gaya hai.**\n\nAb folderwise kaam ke liye **`/fbatch`** use karo.\nCommand: `/fbatch`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
 
 @app.on_message(filters.command("arrange") & filters.private)
 async def arrange_start_handler(client, message):
+    await message.reply_text(
+        "**⚠️ `/arrange` hata diya gaya hai.**\n\nAb folderwise kaam ke liye **`/fbatch`** use karo.\nCommand: `/fbatch`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("fbatch") & filters.private)
+async def fbatch_start_handler(client, message):
     if not await _has_joined(message.chat.id, force=True):
         await _send_join_wall(message)
         return
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
         return
-    print(f"⚡ Processing /arrange for user {message.chat.id}", flush=True)
+    print(f"⚡ Processing /fbatch for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)
     CLONE_STATES.pop(message.chat.id, None)
     CREATE_STATES.pop(message.chat.id, None)
     ORGANIZE_STATES.pop(message.chat.id, None)
+    ARRANGE_STATES.pop(message.chat.id, None)
     PUBLIC_STATES.pop(message.chat.id, None)
-    ARRANGE_STATES[message.chat.id] = {"step": "WAITING_SOURCE"}
+    FBATCH_STATES[message.chat.id] = {"step": "WAITING_SOURCE"}
     await message.reply_text(
-        "**📂 VILLAN ARRANGE — source se dest, folder bana ke, sequencewise**\n"
+        "**📂 VILLAN FBATCH — folderwise batch, sequencewise, NO DELETE**\n"
         "**━━━━━━━━━━━━━━━**\n\n"
         "**Pehle SOURCE group/channel ka link bhejo**\n"
         "(jisme video / pdf / text / pic hain).\n\n"
-        "Uske baad DEST group ka link poochhunga\n"
-        "(jisme folder bana ke bhejna hai).\n\n"
-        "Bot ko **dono groups me admin** rakhna, aur tumhara `/login`\n"
-        "wala account bhi source me member aur dest me admin hona\n"
-        "chahiye (topic banane ke liye). Dest group me **Topics ON**\n"
-        "hona chahiye (forum group).\n\n"
-        "**Delete kuch nahi hoga** — source waisa ka waisa rahega,\n"
-        "sirf dest me copy jayegi, sequencewise.\n\n"
+        "Uske baad DEST group ka link poochhunga.\n\n"
+        "Dest me **sirf bot admin** ho to bhi chalega.\n"
+        "Har file par **download + upload progress** dikhega,\n"
+        "jaise /batch me dikhta hai. **Delete kuch nahi hoga.**\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
-
-
-# --- v49 /public: PUBLIC channel ke liye alag FAST command ---
-# Wajah: /batch me remove/rename/watermark settings lagi hon to _needs_file
-# True ho jata hai aur public channel bhi download+upload (slow) ho jata
-# hai, jabki public ka file_id bot ke paas khud hota hai aur instant bheja
-# ja sakta hai. /public usi fast path ko force karta hai: prefetch download
-# band, file_id se instant delivery. Caption/text ke remove/replace rules
-# phir bhi lagenge (wo text-only hain); filename rename, watermark aur
-# thumbnail /public me nahi lagenge — unhe download chahiye hota hai, aur
-# wahi slow karta tha. Private link /public me mana hai (uske liye /batch).
-PUBLIC_STATES = {}  # uid -> {"step": "WAITING_FIRST_LINK"/"WAITING_LAST_LINK", ...}
 
 
 @app.on_message(filters.command("public") & filters.private)
@@ -4151,6 +4561,13 @@ async def settings_callbacks(client, query):
     if data.startswith("home_"):
         await _handle_home_callbacks(client, query, uid, data)
         return
+    if data == "resume_batch":
+        try:
+            await query.answer("▶️ Resuming batch...")
+        except Exception:
+            pass
+        await _handle_resume(client, uid, query.message)
+        return
     if not data.startswith("st_"):
         return
     if not _is_allowed(uid):
@@ -4504,6 +4921,35 @@ async def message_dispatcher(client, message):
             await run_arrange(client, user_id, src_chat, dest_chat, status_msg)
             return
 
+    if user_id in FBATCH_STATES:
+        step = FBATCH_STATES[user_id].get("step")
+        if step == "WAITING_SOURCE":
+            src_chat = _clone_parse_link(text)
+            if src_chat is None:
+                await message.reply_text("❌ **Invalid link!** Source group/channel ka link bhejo.")
+                return
+            FBATCH_STATES[user_id] = {"step": "WAITING_DEST", "src": src_chat}
+            await message.reply_text(
+                "**📂 Source link lock ho gaya.**\n\n"
+                "**Ab DEST group ka link bhejo**\n"
+                "Dest group me **Topics ON** hona chahiye, aur bot dest me admin hona chahiye.\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        if step == "WAITING_DEST":
+            dest_chat = _clone_parse_link(text)
+            if dest_chat is None:
+                await message.reply_text("❌ **Invalid link!** Dest group ka link bhejo.")
+                return
+            src_chat = FBATCH_STATES[user_id].get("src")
+            FBATCH_STATES.pop(user_id, None)
+            status_msg = await message.reply_text(
+                "📂 **Fbatch Started!** Source se dest tak, folder bana ke, sequencewise copy kar raha hun (delete nahi, progress ke saath)..."
+            )
+            await run_fbatch(client, user_id, src_chat, dest_chat, status_msg)
+            return
+
     if (
         user_id in PUBLIC_STATES
         and PUBLIC_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -4726,8 +5172,8 @@ async def main():
             BotCommand("public", "Public channel fast copy"),
             BotCommand("clone", "Group folders clone karo"),
             BotCommand("create", "Naya group + folders banao"),
-            BotCommand("organize", "Naam se folder + copy (no delete)"),
-            BotCommand("arrange", "Source se dest, folder + sequencewise"),
+            BotCommand("fbatch", "Folderwise batch, sequencewise copy"),
+            BotCommand("resume", "Ruka hua batch wahi se dobara shuru karo"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
             BotCommand("buy", "Premium kharido"),
