@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v54"
+VERSION = "v55"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2254,12 +2254,12 @@ async def _clone_list_topics(userbot, src_chat):
     return topics
 
 
-async def _clone_create_group(userbot, title):
+async def _clone_create_group(userbot, title, about="Cloned by VILLAN bot"):
     """Naya PRIVATE forum group banao (user account se). Returns dest_chat_id ya None."""
     from pyrogram import raw
     title = (title or "Clone")[:120]
     upd = await userbot.invoke(raw.functions.channels.CreateChannel(
-        title=title, about="Cloned by VILLAN bot", megagroup=True, forum=True))
+        title=title, about=about, megagroup=True, forum=True))
     for ch in getattr(upd, "chats", []) or []:
         cid = getattr(ch, "id", None)
         if cid:
@@ -2313,6 +2313,112 @@ async def _clone_send_text(userbot, dest_peer, topic_id, text):
     except Exception as e:
         print(f"[CLONE] text send fail: {e}", flush=True)
         return False
+
+
+# --- v55 CREATE: naya private forum group + apne topics (folders) banao ---
+# User ne manga: /create do -> pehle GROUP NAME poochho -> wo dene ke baad
+# TOPICS NAME poochho -> phir un saare topics naam se folders bana de.
+# Design (v48 /clone ke hi verified tareeke par, naya code nahi):
+# - Group create BOT se nahi hota, sirf user account (userbot, /login session)
+#   se hota hai -> naye group ka owner wahi account hoga jisne /create chalaya.
+# - Topics userbot se banenge (channels.CreateForumTopic, _clone_create_topic
+#   reuse) — bot se topic banane par BOT_METHOD_INVALID aata hai.
+# - Topics ek hi message me bhejne hain: har naam ek nayi line par, ya comma
+#   se alag karke. Jaise:
+#       Maths
+#       Physics
+#       Chemistry
+#   ya: Maths, Physics, Chemistry
+#   Isi ko user ne "ek sath share karna" kaha hai — file names bhi aise hi
+#   bheje ja sakte hain, har file naam ek folder ban jayega.
+# - Group name 1-120 chars, topic naam 1-100 chars (Telegram limit, clone
+#   code bhi yahi truncate karta hai). Khali naam, duplicate naam (same
+#   naam dobara, case ignore karke) aur 50 se zyada topics nahi liye
+#   jayenge — 50 se zyada bheje to pehle 50 banenge, baaki ki list
+#   final message me bata di jayegi (FloodWait se bachne ke liye).
+# - Har topic banane ke baad 1 sec ka gap hai, taaki ek sath bahut saare
+#   topic banane par FloodWait na lage. Koi topic fail ho to poora group
+#   rukega nahi — wo naam failed list me jayega, baaki banenge.
+CREATE_STATES = {}  # uid -> {"step": "WAITING_GROUP_NAME"/"WAITING_TOPICS", "group_name": str}
+CREATE_MAX_TOPICS = 50
+
+
+def _create_parse_topics(text):
+    """Topics wale message ko naam ki list me todo.
+    Line + comma dono se split, khali hatao, order same rakho,
+    duplicate (case-insensitive) sirf pehli baar rakho, 100 chars tak.
+    Returns list[str] (khali ho sakta hai)."""
+    names = []
+    seen = set()
+    for part in (text or "").replace(",", "\n").splitlines():
+        name = part.strip()
+        if not name:
+            continue
+        name = name[:100]
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+async def run_create(client, uid, group_name, topics, status_msg):
+    """Naya private group + topics banao, invite link ke saath report karo."""
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — naya group tumhare "
+                            "account se banega, isliye login session zaroori hai.")
+        return
+    try:
+        dest_id = await _clone_create_group(userbot, group_name, about="Created by VILLAN bot")
+    except Exception as e:
+        await message_reply(status_msg, f"❌ Naya group nahi ban paya: {e}\n"
+                            "Check karo ki tumhara account group bana sakta hai, "
+                            "phir dobara `/create` karo.")
+        return
+    if not dest_id:
+        await message_reply(status_msg, "❌ Naya group nahi ban paya (koi id nahi mili). "
+                            "Dobara `/create` karo.")
+        return
+    created, failed = [], []
+    for ttitle in topics:
+        try:
+            new_tid = await _clone_create_topic(userbot, dest_id, ttitle)
+        except Exception as e:
+            print(f"[CREATE] folder fail '{ttitle}': {e}", flush=True)
+            new_tid = None
+        if new_tid:
+            created.append(ttitle)
+        else:
+            failed.append(ttitle)
+        await asyncio.sleep(1)
+    invite = None
+    try:
+        from pyrogram import raw as _raw
+        dest_peer = await userbot.resolve_peer(dest_id)
+        inv = await userbot.invoke(_raw.functions.messages.ExportChatInvite(
+            peer=dest_peer))
+        invite = getattr(inv, "link", None)
+    except Exception as e:
+        print(f"[CREATE] invite link fail: {e}", flush=True)
+    done_text = ("✅ **Create complete!**\n"
+                 f"📦 Naya group: `{group_name}`\n"
+                 f"📂 Folders ban gaye: `{len(created)}`")
+    if created:
+        done_text += "\n" + "\n".join(f"• {c}" for c in created)
+    if failed:
+        done_text += f"\n❌ Fail hue: `{len(failed)}`\n" + "\n".join(f"• {f}" for f in failed)
+    if len(topics) > CREATE_MAX_TOPICS:
+        done_text += (f"\n⚠️ Sirf pehle `{CREATE_MAX_TOPICS}` topics banaye hain "
+                      "(limit). Baaki ke liye dobara `/create` karo.")
+    if invite:
+        done_text += f"\n🔗 Invite: {invite}"
+    done_text += ("\n\nℹ️ Naya group tumhare account se bana hai, tum uske owner ho. "
+                  "Baad me bot se is group me files bhejni hon to bot ko group me "
+                  "add karna padega, warna sirf tumhara account hi folders me bhej payega.")
+    await safe_edit(status_msg, done_text)
+    await message_reply(status_msg, done_text)
 
 
 async def run_clone(client, uid, src_chat, status_msg):
@@ -2624,6 +2730,7 @@ COMMANDS_TEXT = (
     "`/batch` — Bulk extraction\n"
     "`/public` — Public channel fast copy\n"
     "`/clone` — Clone group folders\n"
+    "`/create` — Naya group + folders banao\n"
     "`/settings` — Rename, caption, watermark\n"
     "`/plan` — Your plan\n"
     "`/buy` — Premium\n"
@@ -2761,6 +2868,9 @@ async def cancel_handler(client, message):
         hit = True
     if uid in SETTING_STATES:
         SETTING_STATES.pop(uid, None)
+        hit = True
+    if uid in CREATE_STATES:
+        CREATE_STATES.pop(uid, None)
         hit = True
     ev = ACTIVE_BATCHES.get(uid)
     if ev is not None:
@@ -2965,6 +3075,7 @@ async def clone_start_handler(client, message):
         return
     print(f"⚡ Processing /clone for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
+    CREATE_STATES.pop(message.chat.id, None)  # v55: adhura /create state na atak jaye
     CLONE_STATES[message.chat.id] = {"step": "WAITING_LINK"}
     await message.reply_text(
         "**📂 VILLAN GROUP CLONE**\n"
@@ -2974,6 +3085,33 @@ async def clone_start_handler(client, message):
         "Naya **private** group tumhare account se banega,\n"
         "usme wahi folders banenge, aur jo kuch hai\n"
         "sab same-to-same copy hoga.\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("create") & filters.private)
+async def create_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"⚡ Processing /create for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
+    CLONE_STATES.pop(message.chat.id, None)  # adhura /clone state na atak jaye
+    PUBLIC_STATES.pop(message.chat.id, None)  # adhura /public state na atak jaye
+    CREATE_STATES[message.chat.id] = {"step": "WAITING_GROUP_NAME"}
+    await message.reply_text(
+        "**📂 VILLAN GROUP CREATE**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**Group ka naam bhejo**\n"
+        "(jis naam ka naya private group banana hai).\n\n"
+        "Uske baad topics ke naam poochhunga,\n"
+        "phir un saare naam se folders ban jayenge.\n\n"
+        "Naya **private** group tumhare account se banega\n"
+        "(bot se group nahi banta, isliye `/login` zaroori hai).\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -3689,6 +3827,46 @@ async def message_dispatcher(client, message):
         await run_clone(client, user_id, src_chat, status_msg)
         return
 
+    # Create flow: pehle group naam, phir topics naam (ek hi message me)
+    if user_id in CREATE_STATES:
+        step = CREATE_STATES[user_id].get("step")
+        if step == "WAITING_GROUP_NAME":
+            group_name = text.strip()[:120]
+            if not group_name:
+                await message.reply_text("❌ Group ka naam khali hai. Dobara naam bhejo.")
+                return
+            CREATE_STATES[user_id] = {"step": "WAITING_TOPICS", "group_name": group_name}
+            await message.reply_text(
+                "**📂 Group naam lock ho gaya:**\n"
+                f"`{group_name}`\n\n"
+                "**Ab topics ke naam bhejo — ek hi message me,**\n"
+                "har naam ek nayi line par, ya comma se alag karke.\n"
+                "Jaise:\n"
+                "`Maths`\n`Physics`\n`Chemistry`\n"
+                "ya: `Maths, Physics, Chemistry`\n\n"
+                "Bhejte hi group + saare folders ban jayenge.\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        if step == "WAITING_TOPICS":
+            topics = _create_parse_topics(text)
+            if not topics:
+                await message.reply_text(
+                    "❌ Koi topic naam nahi mila. Topics ke naam dobara bhejo —\n"
+                    "har naam ek nayi line par, ya comma se alag karke.")
+                return
+            group_name = CREATE_STATES[user_id].get("group_name", "New Group")
+            CREATE_STATES.pop(user_id, None)
+            if len(topics) > CREATE_MAX_TOPICS:
+                topics = topics[:CREATE_MAX_TOPICS]
+            status_msg = await message.reply_text(
+                f"📂 **Create Started!**\nGroup: `{group_name}`\n"
+                f"Folders: `{len(topics)}` — ek-ek karke bana raha hun..."
+            )
+            await run_create(client, user_id, group_name, topics, status_msg)
+            return
+
     if (
         user_id in PUBLIC_STATES
         and PUBLIC_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -3910,6 +4088,7 @@ async def main():
             BotCommand("batch", "Bulk extraction (range)"),
             BotCommand("public", "Public channel fast copy"),
             BotCommand("clone", "Group folders clone karo"),
+            BotCommand("create", "Naya group + folders banao"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
             BotCommand("buy", "Premium kharido"),
