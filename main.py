@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v61"
+VERSION = "v62"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2834,6 +2834,216 @@ async def run_sendall(client, uid, source_msg, status_msg):
     await message_reply(status_msg, done)
 
 
+
+# --- v62 ADDCHANNEL + SENDALLRANGE ---
+# User ne manga (2026-10-29):
+# - "channels ADD karne ka option add kardo" — pehle se bane hue channel
+#   bhi broadcast list me judne chahiye, sirf /mkchannels se bane hue nahi.
+# - "ek baar me sab par 50 MESSAGE (audio / video / text) bhej saku"
+#   — ek message ka /sendall kaafi nahi, 50 message ka batch chahiye.
+# Design:
+# - /addchannel: channel ka link (@username / t.me/username / t.me/c/id /
+#   -100... id) bhejo, userbot se channel verify karo, channels.json me
+#   save karo (source="added", mkchannels wale source="created" hote
+#   hain — list me dono dikhte hain, /sendall dono par kaam karta hai).
+#   Admin check best-effort hai: login account channel ka creator/admin
+#   na ho to bhi add kar diya jayega, par warning di jayegi — kyunki
+#   user admin baad me bhi bana sakta hai, sendall ke time par fail
+#   hoga to report me aa jayega. Add karte time channel ka title,
+#   username aur chat_id save hote hain, duplicate chat_id dobara nahi
+#   judta (purani entry update ho jati hai).
+# - /sendallrange: /public jaisa do-step flow — pehli message ka link,
+#   phir aakhri message ka link. Range MAX 50 message (user ne 50 bola
+#   hai), zyada ho to pehle 50 hi jayenge, baaki ke liye dobara chalao.
+#   Source public ya private channel/group ho sakta hai (userbot ko
+#   uska access hona chahiye, jaise /batch me hota hai). Messages
+#   oldest-first order me, har message ko har saved channel me COPY
+#   kiya jata hai (copy fail ho to forward fallback), har send ke
+#   beech SENDALL_GAP (2 sec) hai. Time estimate: messages * channels
+#   * 2 sec — jaise 50 message * 10 channel = 500 send = ~17 min.
+#   Empty/service message skip hote hain, report me bataye jayenge.
+#   Cancel: SENDALLRANGE_ACTIVE event, /cancel se loop ruk jayega.
+ADDCHANNEL_STATES = {}  # uid -> {"step": "WAITING_LINK"}
+SENDALLRANGE_STATES = {}  # uid -> {"step": "WAITING_FIRST"/"WAITING_LAST", "chat_id", "start_id"}
+SENDALLRANGE_ACTIVE = {}  # uid -> asyncio.Event (cancel flag)
+SENDALLRANGE_MAX = 50
+
+
+def _add_parse_channels(text):
+    """Channel input ko alag-alag part me todo: line + comma dono se.
+    Har part ho sakta hai: t.me link, @username, plain username,
+    t.me/c/id, ya -100... id. Returns list[str] (raw parts, order same)."""
+    parts = []
+    for part in (text or "").replace(",", "\n").splitlines():
+        part = part.strip()
+        if part:
+            parts.append(part)
+    return parts
+
+
+def _add_resolve_identifier(part):
+    """Ek part ko _clone_parse_link jaisi identifier me badlo, ya None."""
+    part = (part or "").strip()
+    if not part:
+        return None
+    if part.lstrip("-").isdigit():
+        return int(part)
+    ident = _clone_parse_link(part)
+    if ident is not None:
+        return ident
+    if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", part.lstrip("@")):
+        return part.lstrip("@")
+    return None
+
+
+async def run_addchannels(client, uid, parts, status_msg):
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — channel verify "
+                            "tumhare account se hoga, isliye login zaroori hai.")
+        return
+    existing = _channels_load(uid)
+    by_id = {c.get("chat_id"): c for c in existing if isinstance(c, dict) and c.get("chat_id")}
+    added, failed = [], []
+    for part in parts:
+        ident = _add_resolve_identifier(part)
+        if ident is None:
+            failed.append((part, "link/username samajh nahi aaya"))
+            continue
+        try:
+            chat = await userbot.get_chat(ident)
+        except Exception as e:
+            failed.append((part, str(e)))
+            continue
+        chat_id = chat.id
+        username = getattr(chat, "username", None)
+        title = getattr(chat, "title", None) or (f"@{username}" if username else str(chat_id))
+        link = f"https://t.me/{username}" if username else ""
+        # Admin check (best-effort, add ko rokta nahi)
+        warn = ""
+        try:
+            me = await userbot.get_me()
+            member = await userbot.get_chat_member(chat_id, me.id)
+            if str(member.status) not in ("creator", "administrator", "ChatMemberStatus.OWNER", "ChatMemberStatus.ADMINISTRATOR"):
+                warn = " (warning: login account is channel ka admin nahi hai — sendall se pehle admin banao, warna send fail hoga)"
+        except Exception:
+            warn = " (warning: admin status check nahi ho paya)"
+        entry = {"username": username, "chat_id": chat_id, "title": title,
+                 "link": link, "source": "added"}
+        by_id[chat_id] = entry
+        added.append((entry, warn))
+    _channels_save(uid, list(by_id.values()))
+    done = ("✅ **Addchannel complete!**\n"
+            f"📢 Channel add hue: `{len(added)}`")
+    for entry, warn in added:
+        done += f"\n• {entry['title']} — {entry['link'] or entry['chat_id']}{warn}"
+    if failed:
+        done += f"\n❌ Fail hue: `{len(failed)}`"
+        for part, err in failed:
+            done += f"\n• {part} — {err}"
+    done += ("\n\nAb in par bhi `/sendall` (1 message) ya `/sendallrange` "
+             "(50 message tak) kaam karega. List dekhne ke liye `/mychannels`.")
+    await safe_edit(status_msg, done)
+    await message_reply(status_msg, done)
+
+
+async def run_sendallrange(client, uid, src_chat, start_id, end_id, status_msg):
+    _ev = asyncio.Event()
+    SENDALLRANGE_ACTIVE[uid] = _ev
+    try:
+        await _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, status_msg, _ev)
+    finally:
+        SENDALLRANGE_ACTIVE.pop(uid, None)
+
+
+async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, status_msg, _ev):
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — source messages "
+                            "tumhare account se padhe jayenge.")
+        return
+    channels = _channels_load(uid)
+    if not channels:
+        await message_reply(status_msg, "❌ Koi channel saved nahi hai. Pehle "
+                            "`/mkchannels` ya `/addchannel` se channels jodo.")
+        return
+    ids = list(range(start_id, end_id + 1))
+    msgs = {}
+    try:
+        chunk = await _fetch_chunk(userbot, src_chat, ids)
+        if isinstance(chunk, dict):
+            msgs = chunk
+    except Exception as e:
+        print(f"[SENDALLRANGE] chunk fetch fail: {e}", flush=True)
+    if not msgs:
+        # Fallback: ek-ek karke
+        for mid in ids:
+            if _ev.is_set():
+                break
+            try:
+                m = await userbot.get_messages(src_chat, mid)
+                if m and not m.empty:
+                    msgs[mid] = m
+            except Exception:
+                continue
+    ordered = [msgs[mid] for mid in sorted(msgs.keys())]
+    usable = [m for m in ordered if (m.text or m.caption or m.photo or m.video
+              or m.document or m.animation or m.audio or m.sticker)]
+    skipped = len(ordered) - len(usable)
+    if not usable:
+        await message_reply(status_msg, "❌ Is range me bhejne layak koi message "
+                            "nahi mila (empty / deleted / access nahi).")
+        return
+    per_channel = {str(c.get("chat_id")): 0 for c in channels if c.get("chat_id")}
+    failed_ch = {}
+    total_sends = 0
+    cancelled = False
+    for m in usable:
+        if _ev.is_set():
+            cancelled = True
+            break
+        for ch in channels:
+            if _ev.is_set():
+                cancelled = True
+                break
+            dest = ch.get("chat_id")
+            if not dest:
+                continue
+            total_sends += 1
+            ok = False
+            err = ""
+            try:
+                await userbot.copy_message(dest, src_chat, m.id)
+                ok = True
+            except Exception as e:
+                err = str(e)
+                try:
+                    await userbot.forward_messages(dest, src_chat, [m.id])
+                    ok = True
+                except Exception as e2:
+                    err = str(e2)
+            if ok:
+                per_channel[str(dest)] = per_channel.get(str(dest), 0) + 1
+            else:
+                failed_ch[str(dest)] = err
+            await asyncio.sleep(SENDALL_GAP)
+    done = ("✅ **Sendallrange complete!**\n"
+            f"📝 Messages: `{len(usable)}` (skip hue empty: `{skipped}`)\n"
+            f"📢 Channels: `{len(channels)}` • Total send: `{total_sends}`")
+    if cancelled:
+        done += "\n🛑 Cancel kar diya gaya — iske baad ke message nahi bheje gaye."
+    for ch in channels:
+        dest = str(ch.get("chat_id"))
+        sent_n = per_channel.get(dest, 0)
+        uname = ch.get("username") or ch.get("title") or dest
+        if dest in failed_ch and sent_n == 0:
+            done += f"\n• @{uname} — ❌ fail ({failed_ch[dest]})"
+        else:
+            done += f"\n• @{uname} — ✅ {sent_n}/{len(usable)}"
+    await safe_edit(status_msg, done)
+    await message_reply(status_msg, done)
+
+
 # --- v56 ORGANIZE: naam samajh ke folder banao, us naam wali saari cheezein
 # us folder me COPY karo (DELETE KUCH NAHI) — text, photo, video, pdf, sab.
 # User ne manga (2026-10-29):
@@ -3907,6 +4117,8 @@ COMMANDS_TEXT = (
     "`/mkchannels` — 10 username se PUBLIC channels banao\n"
     "`/mychannels` — Tumhare banaye channels ki list\n"
     "`/sendall` — Ek message sab channels me bhejo (reply karke ya agla message bhej ke)\n"
+    "`/addchannel` — Pehle se bana channel broadcast list me jodo\n"
+    "`/sendallrange` — Pehli-aakhri link se 50 message tak sab channels me bhejo\n"
     "`/fbatch` — Folderwise batch: source se dest, folder + sequencewise copy (no delete, progress ke saath)\n"
     "`/resume` — Ruka hua batch wahi se dobara shuru karo (pehli file se nahi)\n"
     "`/settings` — Rename, caption, watermark\n"
@@ -4080,6 +4292,16 @@ async def cancel_handler(client, message):
     if ev is not None:
         ev.set()
         hit = True
+    if uid in ADDCHANNEL_STATES:
+        ADDCHANNEL_STATES.pop(uid, None)
+        hit = True
+    if uid in SENDALLRANGE_STATES:
+        SENDALLRANGE_STATES.pop(uid, None)
+        hit = True
+    ev = SENDALLRANGE_ACTIVE.get(uid)
+    if ev is not None:
+        ev.set()
+        hit = True
     if uid in SENDALL_STATES:
         SENDALL_STATES.pop(uid, None)
         hit = True
@@ -4236,6 +4458,8 @@ async def help_handler(client, message):
         "8a. /mkchannels — Public channels banao: /mkchannels likho, phir 10 username ek hi message me bhejo (line ya comma se). Channel tumhare login account se banega, title username hi hoga.\n"
         "8b. /mychannels — Tumhare banaye channels ki list dekho.\n"
         "8c. /sendall — Ek message sab channels me bhejo: kisi message (video / text / image) par reply karke /sendall likho, ya /sendall likh ke agla message bhejo.\n"
+        "8d. /addchannel — Pehle se bana channel jodo: /addchannel likho, phir channel ka link / @username bhejo. Login account us channel ka admin hona chahiye, warna send fail hoga.\n"
+        "8e. /sendallrange — 50 message tak ek saath sab channels me: /sendallrange likho, pehli message ka link bhejo, phir aakhri ka. Audio / video / text sab copy honge, sequencewise.\n"
         "8. /fbatch — Folderwise batch (yehi /organize aur /arrange ki jagah hai): pehle SOURCE group/channel ka link bhejo, phir DEST group ka link bhejo. Bot naam padh ke topic samjhega, dest me us naam ka folder banayega, aur us naam wali saari cheezein (pdf / text / video / pic) us folder me sequencewise COPY karega. Delete kuch nahi hoga, source waisa ka waisa rahega. Har file par download + upload progress dikhega, jaise /batch me dikhta hai. Dest me sirf bot admin ho to bhi chalega, par duplicate folder se bachne ke liye dest me login account ko sirf member bana do. Dest group me Topics ON hona chahiye.\n"
         "9. /settings — Rename, caption template, word remove/replace, thumbnail, watermark, upload method badlo.\n"
         "10. /plan — Apna plan dekho. /buy — Premium kharido (payment manual UPI hai).\n"
@@ -4280,6 +4504,8 @@ async def batch_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /batch for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     MKCHANNELS_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
     # Purani adhuri setting-input state ho to hatao, warna batch ka link
@@ -4305,6 +4531,8 @@ async def clone_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /clone for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     MKCHANNELS_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
     USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
@@ -4333,6 +4561,8 @@ async def create_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /create for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     MKCHANNELS_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
     USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
@@ -4363,6 +4593,8 @@ async def mkchannels_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /mkchannels for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     USER_STATES.pop(message.chat.id, None)
     CLONE_STATES.pop(message.chat.id, None)
     CREATE_STATES.pop(message.chat.id, None)
@@ -4421,6 +4653,8 @@ async def sendall_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /sendall for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     USER_STATES.pop(message.chat.id, None)
     CLONE_STATES.pop(message.chat.id, None)
     CREATE_STATES.pop(message.chat.id, None)
@@ -4440,6 +4674,88 @@ async def sendall_start_handler(client, message):
         "(text / photo / video / document / animation).\n\n"
         "Bhejte hi wo tumhare saved saare channels me jayega.\n"
         "Channels dekhne ke liye: `/mychannels`\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+
+@app.on_message(filters.command("addchannel") & filters.private)
+async def addchannel_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"⚡ Processing /addchannel for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    CREATE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
+    FBATCH_STATES.pop(message.chat.id, None)
+    MKCHANNELS_STATES.pop(message.chat.id, None)
+    SENDALL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
+    # Seedha /addchannel <link> bhi chalega
+    args = message.command[1:] if len(message.command) > 1 else []
+    if args:
+        # Har arg ek alag channel ho sakta hai (space se alag), aur
+        # har arg ke andar comma bhi ho sakta hai — dono ko todo.
+        parts = []
+        for _a in args:
+            parts.extend(_add_parse_channels(_a))
+        status_msg = await message.reply_text(
+            "📢 **Addchannel Started!** Channel verify karke list me jod raha hun...")
+        await run_addchannels(client, message.chat.id, parts, status_msg)
+        return
+    ADDCHANNEL_STATES[message.chat.id] = {"step": "WAITING_LINK"}
+    await message.reply_text(
+        "**📢 VILLAN ADDCHANNEL — Pehle se bana channel jodo**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**Ab channel ka link / username bhejo**\n"
+        "(ek ya zyada, har ek ek nayi line par, ya comma se).\n"
+        "Jaise:\n"
+        "`https://t.me/mychannel`\n`@mychannel`\n`https://t.me/c/1234567890`\n\n"
+        "• Channel **tumhare login account se verify** hoga.\n"
+        "• Login account us channel ka **admin/creator** hona chahiye,\n"
+        "  warna add to ho jayega par sendall ke time fail hoga —\n"
+        "  isliye pehle admin bana lo, to behtar hai.\n"
+        "• Ye channel `/mychannels` list me aa jayega, aur `/sendall` /\n"
+        "  `/sendallrange` dono par kaam karega.\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("sendallrange") & filters.private)
+async def sendallrange_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"⚡ Processing /sendallrange for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    CREATE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
+    FBATCH_STATES.pop(message.chat.id, None)
+    MKCHANNELS_STATES.pop(message.chat.id, None)
+    SENDALL_STATES.pop(message.chat.id, None)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES[message.chat.id] = {"step": "WAITING_FIRST"}
+    await message.reply_text(
+        "**📢 VILLAN SENDALLRANGE — 50 message tak, sab channels me**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**STEP 1/2 — Pehli message ka link bhejo**\n"
+        "Jaise: `https://t.me/mychannel/100`\n\n"
+        "Uske baad aakhri message ka link poochhunga.\n"
+        "Range **max 50 message** hai — zyada ho to pehle 50 hi jayenge.\n"
+        "Audio / video / text / photo — sab copy honge, sequencewise.\n"
+        "Har send ke beech 2 sec ka gap hai, isliye 50 message * 10 channel\n"
+        "ka kaam ~17 min tak chal sakta hai.\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -4470,6 +4786,8 @@ async def fbatch_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /fbatch for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     MKCHANNELS_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
     USER_STATES.pop(message.chat.id, None)
@@ -4505,6 +4823,8 @@ async def public_start_handler(client, message):
         await message.reply_text("⛔ Access denied.")
         return
     print(f"⚡ Processing /public for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
     MKCHANNELS_STATES.pop(message.chat.id, None)
     SENDALL_STATES.pop(message.chat.id, None)
     SETTING_STATES.pop(message.chat.id, None)
@@ -5176,7 +5496,8 @@ async def sendall_media_handler(client, message):
     & ~filters.command(
         ["start", "batch", "cancel", "login", "logout", "settings",
          "allow", "unallow", "users", "paid", "plan", "help", "buy",
-         "mkchannels", "mychannels", "sendall"]
+         "mkchannels", "mychannels", "sendall",
+         "addchannel", "sendallrange"]
     )
 )
 async def message_dispatcher(client, message):
@@ -5259,6 +5580,63 @@ async def message_dispatcher(client, message):
             "📢 **Sendall Started!** Sab channels me ek-ek karke bhej raha hun...")
         await run_sendall(client, user_id, message, status_msg)
         return
+
+    # Addchannel flow: channel link ka jawab aa raha ho
+    if user_id in ADDCHANNEL_STATES:
+        parts = _add_parse_channels(text)
+        if not parts:
+            await message.reply_text(
+                "❌ Koi channel link nahi mila. Channel ka link / username dobara bhejo.")
+            return
+        ADDCHANNEL_STATES.pop(user_id, None)
+        status_msg = await message.reply_text(
+            "📢 **Addchannel Started!** Channel verify karke list me jod raha hun...")
+        await run_addchannels(client, user_id, parts, status_msg)
+        return
+
+    # Sendallrange flow: pehli link, phir aakhri link
+    if user_id in SENDALLRANGE_STATES:
+        step = SENDALLRANGE_STATES[user_id].get("step")
+        if step == "WAITING_FIRST":
+            chat_id, start_id = parse_tg_link(text)
+            if not chat_id or not start_id:
+                await message.reply_text(
+                    "❌ Invalid link. Pehli message ka link bhejo, jaise `https://t.me/mychannel/100`.")
+                return
+            SENDALLRANGE_STATES[user_id] = {"step": "WAITING_LAST", "chat_id": chat_id, "start_id": start_id}
+            await message.reply_text(
+                "**Sendallrange — Start locked.**\n\n"
+                f"Start: `{start_id}`\n"
+                "Ab **aakhri message ka link** bhejo.\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        if step == "WAITING_LAST":
+            chat_id, end_id = parse_tg_link(text)
+            if not chat_id or not end_id:
+                await message.reply_text(
+                    "❌ Invalid link. Aakhri message ka link bhejo.")
+                return
+            state = SENDALLRANGE_STATES.pop(user_id)
+            if state["chat_id"] != chat_id:
+                await message.reply_text("❌ Dono link ek hi channel ke hone chahiye.")
+                return
+            start_id = state["start_id"]
+            if start_id > end_id:
+                start_id, end_id = end_id, start_id
+            total = end_id - start_id + 1
+            if total > SENDALLRANGE_MAX:
+                end_id = start_id + SENDALLRANGE_MAX - 1
+                total = SENDALLRANGE_MAX
+                await message.reply_text(
+                    f"⚠️ Range `{SENDALLRANGE_MAX}` se zyada tha, isliye sirf pehle `{SENDALLRANGE_MAX}` message bheje jayenge. Baaki ke liye dobara `/sendallrange` karo.")
+            channels_n = len(_channels_load(user_id))
+            status_msg = await message.reply_text(
+                f"📢 **Sendallrange Started!**\nMessages: `{total}` • Channels: `{channels_n}` • Total send: `{total * channels_n}`\n"
+                f"⏱️ Lagbhag `{total * channels_n * SENDALL_GAP // 60}` min tak chal sakta hai.")
+            await run_sendallrange(client, user_id, chat_id, start_id, end_id, status_msg)
+            return
 
     # Create flow: pehle group naam, phir topics naam (ek hi message me)
     if user_id in CREATE_STATES:
@@ -5531,6 +5909,18 @@ async def message_dispatcher(client, message):
 # FloodWait na lage. Ye background task me chalta hai, bot start hone me
 # ya chal rahe batch me der nahi karta.
 UPDATE_BROADCAST = os.environ.get("UPDATE_BROADCAST", "1").strip() != "0"
+# v62: Broadcast me sirf "BOT UPDATED" likhna kaafi nahi tha — user ne bola
+# ki restart hone par ye bhi batana chahiye ki restart KYUN hua aur bot me
+# KYA ADD hua hai. Isliye har version ke saath ye notes update karo, aur
+# _broadcast_update() inhe hi bhejega. Notes HTML me hain (broadcast
+# parse_mode=HTML hai), isliye < > mat likhna, sirf • wali lines.
+UPDATE_NOTES = (
+    "• /fbatch aur /public ka fix — pehle NameError aata tha, ab nahi\n"
+    "• /mkchannels — 10 username se PUBLIC channel banao, har channel ke beech 2 min ka gap\n"
+    "• /mychannels aur /sendall — ek message sab channels me bhejo\n"
+    "• /addchannel — pehle se bana channel bhi broadcast list me jodo\n"
+    "• /sendallrange — pehli-aakhri link se 50 message tak sab channels me ek saath\n"
+)
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
 
@@ -5563,10 +5953,12 @@ async def _broadcast_update():
           flush=True)
     sent = failed = 0
     text = (
-        "<b>\U0001f504 BOT UPDATED</b>\n\n"
-        "<b>Please restart your download.</b>\n"
-        "<b>Agar tumhara batch ruk gaya ho to dobara /batch bhejo "
-        "- naya version live hai.</b>"
+        "<b>\U0001f504 BOT RESTARTED — naya version deploy hua hai</b>\n\n"
+        "Bot crash nahi hua hai. Naya update live karne ke liye bot ko "
+        "restart kiya gaya hai, isliye chal raha batch ruk gaya hoga.\n\n"
+        "<b>Is update me ye add hua hai:</b>\n"
+        + UPDATE_NOTES +
+        "\n\n<b>Agar tumhara batch ruk gaya ho to dobara /batch bhejo.</b>"
     )
     for uid in users:
         try:
@@ -5608,6 +6000,8 @@ async def main():
             BotCommand("mkchannels", "10 username se PUBLIC channels banao"),
             BotCommand("mychannels", "Tumhare channels ki list"),
             BotCommand("sendall", "Ek message sab channels me bhejo"),
+            BotCommand("addchannel", "Pehle se bana channel jodo"),
+            BotCommand("sendallrange", "50 message tak sab channels me bhejo"),
             BotCommand("fbatch", "Folderwise batch, sequencewise copy"),
             BotCommand("resume", "Ruka hua batch wahi se dobara shuru karo"),
             BotCommand("settings", "Customize panel"),
