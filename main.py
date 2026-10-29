@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v56"
+VERSION = "v57"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2214,6 +2214,12 @@ def _clone_parse_link(text):
     """Clone ke liye group link parse karo. Message ID zaroori nahi — poora
     group chahiye, isliye sirf chat pehchano. Returns chat_id (int/str) ya None."""
     import re as _re
+    # Invite link (https://t.me/+xxxx ya joinchat) — username regex isko
+    # pakad nahi pata tha, isliye /organize par "Invalid link" aata tha
+    # (screenshot 2026-10-29). Poora link hi wapas do, get_chat/join_chat
+    # wahi handle karega (_get_chat_maybe_invite dekho).
+    if text and ("t.me/+" in text or "joinchat" in text):
+        return text.strip()
     m = _re.search(r"t\.me/c/(\d+)", text or "")
     if m:
         return int(f"-100{m.group(1)}")
@@ -2547,6 +2553,22 @@ def _organize_name_for_msg(msg, info):
     return ""
 
 
+async def _get_chat_maybe_invite(userbot, src):
+    """get_chat karo; invite link ho aur get_chat fail ho to ek baar
+    join_chat karke dobara try karo (pehle se member ho to join wali
+    error ignore karo, dobara get_chat hi chalega)."""
+    try:
+        return await userbot.get_chat(src)
+    except Exception:
+        if isinstance(src, str) and ("t.me/+" in src or "joinchat" in src):
+            try:
+                await userbot.join_chat(src)
+            except Exception:
+                pass
+            return await userbot.get_chat(src)
+        raise
+
+
 async def run_organize(client, uid, src_chat, status_msg):
     """Source group ki history padho -> naam se topic samjho -> folder banao
     (ya pehle wala reuse karo) -> har item ki ek COPY us folder me bhejo.
@@ -2560,8 +2582,12 @@ async def run_organize(client, uid, src_chat, status_msg):
     ORGANIZE_ACTIVE[uid] = cancel_event
     try:
         try:
-            src = await userbot.get_chat(src_chat)
+            src = await _get_chat_maybe_invite(userbot, src_chat)
             src_title = getattr(src, "title", None) or str(src_chat)
+            # Invite link se aaye to aage ke saare kaam (topics, peer) ke liye
+            # numeric id hi use karo, warna resolve_peer invite par fail hoga.
+            if getattr(src, "id", None):
+                src_chat = src.id
         except Exception as e:
             await message_reply(status_msg, f"❌ Source group nahi khul raha: {e}\n"
                                 "Check karo ki tumhara account us group ka member hai.")
@@ -2594,7 +2620,7 @@ async def run_organize(client, uid, src_chat, status_msg):
                     if orig_title and orig_title.lower() == tname.lower():
                         continue
                 key = tname.lower()
-                buckets.setdefault(key, {"name": tname, "msgs": []}).append(msg)
+                buckets.setdefault(key, {"name": tname, "msgs": []})["msgs"].append(msg)
         except Exception as e:
             await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
             return
@@ -2686,6 +2712,216 @@ async def run_organize(client, uid, src_chat, status_msg):
         await message_reply(status_msg, done_text)
     finally:
         ORGANIZE_ACTIVE.pop(uid, None)
+
+
+# --- v57 ARRANGE: source group/channel -> dest group, naam se folder, sequencewise copy ---
+# User ne manga (2026-10-29, /organize wale screenshot ke baad):
+# - "bot dono group m admin rhega"
+# - "bot phle uss group/channel ka link mangega jisme video ho, then wo
+#   group link mangega jisme bhejna h folder bna k, then apna process
+#   start krega or sequencewise bhej dega"
+# - Command: /Arrange (Telegram command lower-case me register hai, isliye
+#   /arrange likhna hi kaam karega; /Arrange bhi wahi command hai).
+# Flow: /arrange -> SOURCE link poochho -> DEST link poochho -> process.
+# Asli kaam /login wala account (userbot) karega, jaise /clone aur
+# /organize karte hain — bot akela purani history nahi padh sakta, isliye
+# bot ko dono groups me admin rakhna achha hai, par kaafi nahi hai:
+# login account ko SOURCE me member aur DEST me admin (topic banane ke
+# liye) hona hi chahiye, warna topic creation fail hogi.
+# - DEST group forum hona chahiye (Topics ON). Forum nahi hai to pehle
+#   ToggleForum try kiya jayega (user account se); na ho to bot ruk
+#   jayega aur bolega ki group settings me Topics ON karo, phir dobara
+#   /arrange chalao. Aadha kaam (kuch folders ban ke) nahi chhoda jayega.
+# - DELETE KUCH NAHI: source group me kuch change nahi hoga, sirf DEST me
+#   copy jayegi. /organize ki tarah hi, original safe rahega.
+# - SEQUENCEWISE: har folder ke andar oldest-first order me copy hogi
+#   (message ID ke hisaab se purani se nayi), taaki Chapter 1, 2, 3 ka
+#   order folder ke andar sahi rahe. Folder ka order alphabetical hai
+#   (deterministic, check karne me aasan).
+# - Topic naam ka rule v56 /organize wala hi hai (_organize_topic_name):
+#   "Maths Chapter 1.pdf" -> "Maths", "Physics Lecture 3.mp4" -> "Physics".
+# - Invite link (t.me/+...) bhi chalega: _get_chat_maybe_invite se join
+#   karke khola jayega. Best phir bhi t.me/c/... ya @username hi hai.
+ARRANGE_STATES = {}  # uid -> {"step": "WAITING_SOURCE"/"WAITING_DEST", "src": ...}
+ARRANGE_ACTIVE = {}  # uid -> asyncio.Event (cancel flag, /cancel se set hota hai)
+
+
+def _arrange_parse_link(text):
+    """Source/dest link parse karo. _clone_parse_link hi use karo — wo
+    t.me/c/, @username, t.me/username aur t.me/+ invite sab deta hai."""
+    return _clone_parse_link(text)
+
+
+async def run_arrange(client, uid, src_chat, dest_chat, status_msg):
+    """Source ki history -> naam se topic -> DEST me folder (ya reuse) ->
+    har item ki COPY DEST folder me, oldest-first, sequencewise. NO DELETE."""
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — source ki history aur "
+                            "dest me folder, dono tumhare account se honge.")
+        return
+    cancel_event = asyncio.Event()
+    ARRANGE_ACTIVE[uid] = cancel_event
+    try:
+        try:
+            src = await _get_chat_maybe_invite(userbot, src_chat)
+            src_title = getattr(src, "title", None) or str(src_chat)
+            if getattr(src, "id", None):
+                src_chat = src.id
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Source group/channel nahi khul raha: {e}\n"
+                                "Check karo ki tumhara account uska member hai.")
+            return
+        try:
+            dest = await _get_chat_maybe_invite(userbot, dest_chat)
+            dest_title = getattr(dest, "title", None) or str(dest_chat)
+            if getattr(dest, "id", None):
+                dest_chat = dest.id
+        except Exception as e:
+            await message_reply(status_msg, f"❌ Dest group nahi khul raha: {e}\n"
+                                "Check karo ki tumhara account us group ka member hai.")
+            return
+        # DEST forum check: forum nahi hai to ToggleForum try karo, na ho to ruko.
+        is_forum = getattr(dest, "is_forum", None)
+        if is_forum is False:
+            toggled = False
+            try:
+                from pyrogram import raw as _raw
+                if hasattr(_raw.functions.channels, "ToggleForum"):
+                    await userbot.invoke(_raw.functions.channels.ToggleForum(
+                        channel=await userbot.resolve_peer(dest_chat), enabled=True))
+                    dest2 = await userbot.get_chat(dest_chat)
+                    toggled = getattr(dest2, "is_forum", False) is True
+            except Exception as e:
+                print(f"[ARRANGE] ToggleForum fail: {e}", flush=True)
+            if not toggled:
+                await message_reply(status_msg, "❌ **Dest group forum nahi hai!**\n"
+                                    "Dest group ki Settings me jaake **Topics ON** karo, "
+                                    "phir dobara `/arrange` chalao. Tab tak kuch copy nahi hua hai.")
+                return
+        await safe_edit(status_msg, f"🔍 **Arrange shuru:**\nSource: `{src_title}`\nDest: `{dest_title}`\nMessages nikal raha hun...")
+        try:
+            existing = await _clone_list_topics(userbot, dest_chat)
+            topic_map = {ttitle.lower(): tid for tid, ttitle in (existing or [])}
+        except Exception:
+            topic_map = {}
+        buckets = {}
+        try:
+            async for msg in userbot.get_chat_history(src_chat):
+                if cancel_event.is_set():
+                    break
+                if not msg or getattr(msg, "empty", False):
+                    continue
+                info = _info_from_msg(msg, msg.id)
+                if info is None:
+                    continue
+                # ARRANGE me source topic se koi matlab nahi — dest alag group
+                # hai, isliye har item ko uske naam ke folder me copy karo,
+                # chahe source me wo kisi bhi topic me ho.
+                tname = _organize_topic_name(_organize_name_for_msg(msg, info))
+                key = tname.lower()
+                buckets.setdefault(key, {"name": tname, "msgs": []})["msgs"].append(msg)
+        except Exception as e:
+            await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
+            return
+        total = sum(len(v["msgs"]) for v in buckets.values())
+        await safe_edit(status_msg, f"📂 **Topics mile:** `{len(buckets)}`\n"
+                        f"Items: `{total}` — dest me folders bana raha hun...")
+        dest_peer = await userbot.resolve_peer(dest_chat)
+        copied = failed = skipped = 0
+        folder_report = []
+        for key in sorted(buckets.keys()):
+            if cancel_event.is_set():
+                break
+            b = buckets[key]
+            tname = b["name"]
+            dest_tid = topic_map.get(key)
+            is_new = False
+            if not dest_tid:
+                try:
+                    dest_tid = await _clone_create_topic(userbot, dest_chat, tname)
+                except Exception as e:
+                    print(f"[ARRANGE] folder fail '{tname}': {e}", flush=True)
+                    dest_tid = None
+                if dest_tid:
+                    topic_map[key] = dest_tid
+                    is_new = True
+            if not dest_tid:
+                failed += len(b["msgs"])
+                folder_report.append(f"• {tname}: ❌ folder nahi bana ({len(b['msgs'])} fail)")
+                continue
+            f_copied = f_failed = 0
+            await safe_edit(status_msg, f"📂 **Folder:** `{tname}` ({'naya' if is_new else 'pehle se tha'})\n"
+                            f"Copy ho raha hai... (total ab tak: ✅ {copied} | ❌ {failed})")
+            for m in reversed(b["msgs"]):  # oldest-first = sequencewise
+                if cancel_event.is_set():
+                    break
+                if not m.media and not m.text:
+                    skipped += 1
+                    continue
+                info = _info_from_msg(m, m.id)
+                if info is None:
+                    skipped += 1
+                    continue
+                if info.get("kind") == "too_big":
+                    failed += 1
+                    f_failed += 1
+                    continue
+                if info.get("kind") == "text":
+                    if await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]):
+                        copied += 1
+                        f_copied += 1
+                    else:
+                        failed += 1
+                        f_failed += 1
+                    continue
+                fp = await download_file(userbot, info, None, None, uid, client)
+                if not fp:
+                    failed += 1
+                    f_failed += 1
+                    if info.get("tmpdir"):
+                        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                    continue
+                ok = await _raw_send_to_topic(
+                    userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
+                    caption=info.get("caption") or "", info=info)
+                if info.get("tmpdir"):
+                    shutil.rmtree(info["tmpdir"], ignore_errors=True)
+                if ok:
+                    copied += 1
+                    f_copied += 1
+                else:
+                    failed += 1
+                    f_failed += 1
+                await asyncio.sleep(2)
+            folder_report.append(f"• {tname}: ✅ {f_copied} | ❌ {f_failed}")
+            if cancel_event.is_set():
+                break
+        invite = None
+        try:
+            from pyrogram import raw as _raw
+            inv = await userbot.invoke(_raw.functions.messages.ExportChatInvite(
+                peer=dest_peer))
+            invite = getattr(inv, "link", None)
+        except Exception as e:
+            print(f"[ARRANGE] invite link fail: {e}", flush=True)
+        done_text = ("✅ **Arrange complete!**\n"
+                     f"📦 Source: `{src_title}`\n"
+                     f"📦 Dest: `{dest_title}`\n"
+                     f"📂 Folders: `{len(buckets)}`\n"
+                     f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`\n"
+                     "🛡️ **Delete kuch nahi hua** — source group waisa ka waisa hai, "
+                     "sirf dest me copy gayi hai.")
+        if folder_report:
+            done_text += "\n" + "\n".join(folder_report)
+        if invite:
+            done_text += f"\n🔗 Dest invite: {invite}"
+        if cancel_event.is_set():
+            done_text = "🛑 **Arrange stopped.**\n" + done_text
+        await safe_edit(status_msg, done_text)
+        await message_reply(status_msg, done_text)
+    finally:
+        ARRANGE_ACTIVE.pop(uid, None)
 
 
 async def run_clone(client, uid, src_chat, status_msg):
@@ -2999,6 +3235,7 @@ COMMANDS_TEXT = (
     "`/clone` — Clone group folders\n"
     "`/create` — Naya group + folders banao\n"
     "`/organize` — Naam se folder + copy (no delete)\n"
+    "`/arrange` — Source se dest, folder + sequencewise copy\n"
     "`/settings` — Rename, caption, watermark\n"
     "`/plan` — Your plan\n"
     "`/buy` — Premium\n"
@@ -3144,6 +3381,13 @@ async def cancel_handler(client, message):
         ORGANIZE_STATES.pop(uid, None)
         hit = True
     ev = ORGANIZE_ACTIVE.get(uid)
+    if ev is not None:
+        ev.set()
+        hit = True
+    if uid in ARRANGE_STATES:
+        ARRANGE_STATES.pop(uid, None)
+        hit = True
+    ev = ARRANGE_ACTIVE.get(uid)
     if ev is not None:
         ev.set()
         hit = True
@@ -3351,6 +3595,7 @@ async def clone_start_handler(client, message):
     print(f"⚡ Processing /clone for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)  # purana adhura batch state na atak jaye
     CREATE_STATES.pop(message.chat.id, None)  # v55: adhura /create state na atak jaye
+    ARRANGE_STATES.pop(message.chat.id, None)
     CLONE_STATES[message.chat.id] = {"step": "WAITING_LINK"}
     await message.reply_text(
         "**📂 VILLAN GROUP CLONE**\n"
@@ -3417,6 +3662,39 @@ async def organize_start_handler(client, message):
         "nahi hoga, wahi rahega.**\n\n"
         "Jaise: `Maths Chapter 1.pdf` -> `Maths` folder,\n"
         "`Physics Lecture 3.mp4` -> `Physics` folder.\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("arrange") & filters.private)
+async def arrange_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"⚡ Processing /arrange for user {message.chat.id}", flush=True)
+    USER_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    CREATE_STATES.pop(message.chat.id, None)
+    ORGANIZE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
+    ARRANGE_STATES[message.chat.id] = {"step": "WAITING_SOURCE"}
+    await message.reply_text(
+        "**📂 VILLAN ARRANGE — source se dest, folder bana ke, sequencewise**\n"
+        "**━━━━━━━━━━━━━━━**\n\n"
+        "**Pehle SOURCE group/channel ka link bhejo**\n"
+        "(jisme video / pdf / text / pic hain).\n\n"
+        "Uske baad DEST group ka link poochhunga\n"
+        "(jisme folder bana ke bhejna hai).\n\n"
+        "Bot ko **dono groups me admin** rakhna, aur tumhara `/login`\n"
+        "wala account bhi source me member aur dest me admin hona\n"
+        "chahiye (topic banane ke liye). Dest group me **Topics ON**\n"
+        "hona chahiye (forum group).\n\n"
+        "**Delete kuch nahi hoga** — source waisa ka waisa rahega,\n"
+        "sirf dest me copy jayegi, sequencewise.\n\n"
         "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
@@ -4187,6 +4465,45 @@ async def message_dispatcher(client, message):
         await run_organize(client, user_id, src_chat, status_msg)
         return
 
+    # Arrange flow: pehle source link, phir dest link
+    if user_id in ARRANGE_STATES:
+        step = ARRANGE_STATES[user_id].get("step")
+        if step == "WAITING_SOURCE":
+            src_chat = _arrange_parse_link(text)
+            if src_chat is None:
+                await message.reply_text("❌ **Invalid link!** Source group/channel ka link bhejo "
+                                         "(jaise `https://t.me/c/1234567890`, `@groupname`, "
+                                         "ya invite link `https://t.me/+xxxx`).")
+                return
+            ARRANGE_STATES[user_id] = {"step": "WAITING_DEST", "src": src_chat}
+            await message.reply_text(
+                "**📂 Source link lock ho gaya.**\n\n"
+                "**Ab DEST group ka link bhejo**\n"
+                "(jisme folder bana ke bhejna hai).\n\n"
+                "Dest group me **Topics ON** hona chahiye, aur bot +\n"
+                "tumhara login account dono dest me admin hone chahiye.\n\n"
+                "Dest link bhejte hi process start ho jayega,\n"
+                "sequencewise copy hogi.\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        if step == "WAITING_DEST":
+            dest_chat = _arrange_parse_link(text)
+            if dest_chat is None:
+                await message.reply_text("❌ **Invalid link!** Dest group ka link bhejo "
+                                         "(jaise `https://t.me/c/1234567890`, `@groupname`, "
+                                         "ya invite link `https://t.me/+xxxx`).")
+                return
+            src_chat = ARRANGE_STATES[user_id].get("src")
+            ARRANGE_STATES.pop(user_id, None)
+            status_msg = await message.reply_text(
+                "📂 **Arrange Started!** Source se dest tak, folder bana ke, "
+                "sequencewise copy kar raha hun (delete nahi)..."
+            )
+            await run_arrange(client, user_id, src_chat, dest_chat, status_msg)
+            return
+
     if (
         user_id in PUBLIC_STATES
         and PUBLIC_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -4410,6 +4727,7 @@ async def main():
             BotCommand("clone", "Group folders clone karo"),
             BotCommand("create", "Naya group + folders banao"),
             BotCommand("organize", "Naam se folder + copy (no delete)"),
+            BotCommand("arrange", "Source se dest, folder + sequencewise"),
             BotCommand("settings", "Customize panel"),
             BotCommand("plan", "Apna plan dekho"),
             BotCommand("buy", "Premium kharido"),
