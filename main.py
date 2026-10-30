@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v66"
+VERSION = "v67"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -5773,7 +5773,10 @@ async def message_dispatcher(client, message):
                 bio = MKCHANNELS_DEFAULT_BIO
             else:
                 bio = text.strip()[:255]
-            MKCHANNELS_STATES[user_id] = {"step": "WAITING_USERNAMES", "title": MKCHANNELS_STATES[user_id].get("title"), "bio": bio, "dp_path": MKCHANNELS_STATES[user_id].get("dp_path")}
+            # v67 fix: title state se pehle nikaal lo, warna neeche reply
+            # me {title} UnboundLocalError dega (v66 me yahi crash tha).
+            title = MKCHANNELS_STATES[user_id].get("title")
+            MKCHANNELS_STATES[user_id] = {"step": "WAITING_USERNAMES", "title": title, "bio": bio, "dp_path": MKCHANNELS_STATES[user_id].get("dp_path")}
             await message.reply_text(
                 f"**📢 Bio locked.**\n\n"
                 "**STEP 4/4 — Ab 10 username bhejo — ek hi message me,**\n"
@@ -6165,6 +6168,7 @@ UPDATE_NOTES = (
     "• /mkchannels — ab DP aur bio bhi poochhega, naam + DP + bio sab channels par ek saath lagega (DP na do to default rahega)\n"
     "• /sendall aur /sendallrange — ab bot fallback bhi hai, login account fail ho to bot admin se bhejega (Post Messages ON hona chahiye)\n"
     "• /mkchannels — har naye channel me bot bhi admin banega (Post Messages ON), taaki 1 account se sab par broadcast ho sake; /organize aur /arrange hata diye gaye, folderwise kaam sirf /fbatch se hoga\n"
+    "• /mkchannels bio step ka crash fix — bio bhejte hi jo UnboundLocalError aata tha aur flow atak jata tha (isliye DP kabhi lagti hi nahi thi), wo theek hua\n"
 )
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
