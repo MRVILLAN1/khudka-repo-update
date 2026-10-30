@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v67"
+VERSION = "v71"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -296,6 +296,13 @@ def _sub_remaining(uid: int) -> int:
     if not sub:
         return 0
     return max(0, int(sub.get("expiry", 0) - time.time()))
+
+
+def _is_premium(uid: int) -> bool:
+    """Premium = paid subscription active hai. Owner hamesha premium."""
+    if _is_owner(uid):
+        return True
+    return _sub_remaining(uid) > 0
 
 
 def _is_allowed(uid: int) -> bool:
@@ -2403,14 +2410,24 @@ async def _clone_list_topics(userbot, src_chat):
         res = await userbot.invoke(raw.functions.channels.GetForumTopics(
             channel=peer, offset_date=offset_date, offset_id=offset_id,
             offset_topic=offset_topic, limit=100))
-        batch = [(t.id, t.title) for t in res.topics]
+        batch = []
+        for t in res.topics:
+            if type(t).__name__ == "ForumTopicDeleted":
+                continue
+            _tid = getattr(t, "id", None)
+            _ttitle = getattr(t, "title", None)
+            if _tid is None or not _ttitle:
+                continue
+            batch.append((_tid, _ttitle))
         if not batch:
             break
         topics.extend(batch)
         if len(batch) < 100:
             break
         last = res.topics[-1]
-        offset_date, offset_id, offset_topic = last.date, last.top_message, last.id
+        offset_date = getattr(last, "date", offset_date)
+        offset_id = getattr(last, "top_message", offset_id)
+        offset_topic = getattr(last, "id", offset_topic)
     return topics
 
 
@@ -2677,7 +2694,7 @@ def _mk_split_raw(text):
     return raw
 
 
-async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot_id=None):
+async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot_id=None, bot_username=None):
     """Ek PUBLIC channel banao + username set karo.
     Title = user ka diya hua common naam (v63), na diya ho to username.
     Bio = user ka diya hua bio (v64), na diya ho to default bio.
@@ -2720,25 +2737,47 @@ async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot
             pass
         return None, str(e), ""
     bot_warn = ""
-    if bot_id:
+    if not bot_id:
+        bot_warn = "bot id nahi mila (get_me fail)"
+    else:
+        # v70 FIX: sirf promote karna kaafi nahi tha — Telegram channel
+        # me EditAdmin tabhi chalta hai jab wo user channel ka member ho.
+        # Bot channel ka member nahi hota hai, isliye seedha promote
+        # USER_NOT_PARTICIPANT jaisi error se fail ho jata tha, aur
+        # channel ban jata tha par bot admin nahi banta tha (yehi user
+        # ki shikayat thi). Isliye pehle promote try karo, fail ho to
+        # bot ko channel me ADD (invite) karo, phir dobara promote karo.
+        from pyrogram.types import ChatPrivileges
+        _priv = ChatPrivileges(
+            can_post_messages=True,
+            can_edit_messages=True,
+            can_delete_messages=False,
+            can_manage_chat=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_topics=False,
+        )
         try:
-            from pyrogram.types import ChatPrivileges
-            await userbot.promote_chat_member(
-                cid, bot_id,
-                privileges=ChatPrivileges(
-                    can_post_messages=True,
-                    can_edit_messages=True,
-                    can_delete_messages=False,
-                    can_manage_chat=False,
-                    can_restrict_members=False,
-                    can_promote_members=False,
-                    can_change_info=False,
-                    can_invite_users=False,
-                    can_pin_messages=False,
-                    can_manage_topics=False,
-                ))
-        except Exception as e:
-            bot_warn = f"bot admin fail: {e}"
+            await userbot.promote_chat_member(cid, bot_id, privileges=_priv)
+        except Exception as e1:
+            try:
+                await userbot.add_chat_members(cid, bot_id)
+            except Exception:
+                try:
+                    _bot_peer = await userbot.resolve_peer(bot_username) if bot_username else await userbot.resolve_peer(bot_id)
+                    _chan_peer = await userbot.resolve_peer(cid)
+                    await userbot.invoke(raw.functions.channels.InviteToChannel(
+                        channel=_chan_peer, users=[_bot_peer]))
+                except Exception:
+                    pass
+            try:
+                await userbot.promote_chat_member(cid, bot_id, privileges=_priv)
+            except Exception as e2:
+                bot_warn = f"bot admin fail: {e2} (pehle try: {e1})"
+                print(f"[MKCHANNELS] bot admin fail @{username}: {bot_warn}", flush=True)
     return cid, f"https://t.me/{username}", bot_warn
 
 
@@ -2768,11 +2807,14 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
     created, failed = [], []
     bot_admin_failed = []
     bot_id = None
+    bot_username = None
     try:
         _me = await client.get_me()
         bot_id = _me.id
+        bot_username = getattr(_me, "username", None)
     except Exception:
         bot_id = None
+        bot_username = None
     for i, username in enumerate(usernames):
         if _ev.is_set():
             failed.append((username, "cancel kar diya gaya"))
@@ -2785,7 +2827,7 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         except Exception:
             pass
         try:
-            cid, res, bot_warn = await _mk_create_public_channel(userbot, username, title=title, bio=bio, bot_id=bot_id)
+            cid, res, bot_warn = await _mk_create_public_channel(userbot, username, title=title, bio=bio, bot_id=bot_id, bot_username=bot_username)
         except FloodWait as e:
             failed.append((username, f"FloodWait {e.value}s — baaki ruk gaye"))
             print(f"[MKCHANNELS] FloodWait {username}: {e.value}s", flush=True)
@@ -3991,6 +4033,7 @@ async def run_clone(client, uid, src_chat, status_msg):
         topic_titles = {tid: ttitle for tid, ttitle in (topics or [])}
         # STEP 1: saari history ek baar me group karo (newest-first aati hai)
         buckets = {}
+        _hist_n = 0
         try:
             async for msg in userbot.get_chat_history(src_chat):
                 if cancel_event.is_set():
@@ -3998,6 +4041,13 @@ async def run_clone(client, uid, src_chat, status_msg):
                 if not msg or getattr(msg, "empty", False):
                     continue
                 buckets.setdefault(_clone_topic_key(msg), []).append(msg)
+                _hist_n += 1
+                # v69 visibility: history padhte waqt chup mat raho — har
+                # 50 messages par status update karo, taaki user ko pata
+                # chale ki kuch padha ja raha hai, atak nahi gaya hai.
+                if _hist_n % 50 == 0:
+                    await safe_edit(status_msg,
+                        f"🔍 **History padh raha hun...**\nMessages mile: `{_hist_n}` (ab tak)")
         except Exception as e:
             await message_reply(status_msg, f"❌ History nahi padh paya: {e}")
             return
@@ -4042,7 +4092,8 @@ async def run_clone(client, uid, src_chat, status_msg):
             fname = topic_titles.get(key, "General") if key != 1 else "General"
             await safe_edit(status_msg, f"📂 **Folder:** `{fname}`\n"
                             f"Copy ho raha hai... (total ab tak: ✅ {copied} | ❌ {failed})")
-            for m in reversed(msgs):  # oldest-first = same order
+            _folder_msgs = list(reversed(msgs))  # oldest-first = same order
+            for _fi, m in enumerate(_folder_msgs, 1):
                 if cancel_event.is_set():
                     break
                 if not m.media and not m.text:
@@ -4061,12 +4112,25 @@ async def run_clone(client, uid, src_chat, status_msg):
                     else:
                         failed += 1
                     continue
+                # v69 visibility: har media file par download aur upload
+                # dono dikhao, taaki clone me ye pata chale ki kuch ho raha
+                # hai ya nahi (pehle sirf folder naam dikhta tha).
+                await safe_edit(status_msg,
+                    f"📂 **Folder:** `{fname}`\n"
+                    f"⬇️ **Download ho raha hai:** `{info.get('file_name') or m.id}` "
+                    f"({_fi}/{len(_folder_msgs)})\n"
+                    f"Total ab tak: ✅ {copied} | ❌ {failed}")
                 fp = await download_file(userbot, info, None, None, uid, client)
                 if not fp:
                     failed += 1
                     if info.get("tmpdir"):
                         shutil.rmtree(info["tmpdir"], ignore_errors=True)
                     continue
+                await safe_edit(status_msg,
+                    f"📂 **Folder:** `{fname}`\n"
+                    f"⬆️ **Upload ho raha hai:** `{info.get('file_name') or m.id}` "
+                    f"({_fi}/{len(_folder_msgs)})\n"
+                    f"Total ab tak: ✅ {copied} | ❌ {failed}")
                 ok = await _raw_send_to_topic(
                     userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
                     caption=info.get("caption") or "", info=info)
@@ -4287,7 +4351,7 @@ COMMANDS_TEXT = (
     "`/help` — Guide\n"
     "`/cancel` — Stop current task\n"
     "Send a link directly for a single file.\n\n"
-    "**Owner:** `/paid <id> <days>` • `/allow` • `/unallow` • `/users`"
+    "**Owner:** `/premium <id> <amount> <unit>` • `/normal <id>` • `/unallow` • `/users`"
 )
 
 DISCLAIMER_TEXT = (
@@ -4308,8 +4372,8 @@ WARNINGS_TEXT = (
 
 ADMIN_TEXT = (
     "**Admin Panel**\n\n"
-    "`/paid <user_id> <days>` — Grant premium\n"
-    "`/allow <user_id>` — Lifetime access\n"
+    "`/premium <user_id> <amount> <unit>` — Grant premium\n"
+    "`/normal <user_id>` — Make normal (batch only)\n"
     "`/unallow <user_id>` — Remove access\n"
     "`/users` — Paid + allowed users\n\n"
     "Payment is manual (UPI). Plans activate here."
@@ -4489,26 +4553,6 @@ async def cancel_handler(client, message):
 
 
 # --- OWNER ADMIN COMMANDS ---
-@app.on_message(filters.command("allow") & filters.private)
-async def allow_handler(client, message):
-    uid = message.chat.id
-    if not _is_owner(uid):
-        await message.reply_text("⛔ Owner only.")
-        return
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.reply_text(
-            "Usage: `/allow <user_id>`\n(User ID @userinfobot se milegi)"
-        )
-        return
-    target = int(parts[1])
-    allowed = _load_allowed()
-    allowed.add(target)
-    _save_allowed(allowed)
-    await message.reply_text(
-        f"✅ `{target}` ko permission mil gayi.\nAb wo `/login` karke bot use kar sakta hai."
-    )
-
 
 @app.on_message(filters.command("unallow") & filters.private)
 async def unallow_handler(client, message):
@@ -4556,41 +4600,90 @@ async def users_handler(client, message):
     )
 
 
-@app.on_message(filters.command("paid") & filters.private)
-async def paid_handler(client, message):
-    """Owner kisi ko time-based paid access de: /paid <user_id> <days>"""
+
+@app.on_message(filters.command("premium") & filters.private)
+async def premium_handler(client, message):
+    """Owner kisi ko premium de: /premium <user_id> <amount> <unit>
+    Unit: hour(s), day(s), month(s), year(s). Month = 30 din, year = 365 din.
+    Purana form /premium <user_id> <days> bhi chalega (days maan ke)."""
     uid = message.chat.id
     if not _is_owner(uid):
         await message.reply_text("⛔ Owner only.")
         return
     parts = message.text.split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+    if len(parts) not in (3, 4):
         await message.reply_text(
-            "Usage: `/paid <user_id> <days>`\nJaise: `/paid 123456789 30`"
-        )
+            "Usage: `/premium <user_id> <amount> <unit>`\n"
+            "Jaise: `/premium 123456789 1 month` • `/premium 123456789 2 hours` • "
+            "`/premium 123456789 30 days` • `/premium 123456789 1 year`\n"
+            "Unit: hour(s), day(s), month(s), year(s)")
         return
-    target, days = int(parts[1]), int(parts[2])
-    if days <= 0 or days > 3650:
-        await message.reply_text("❌ Days 1 se 3650 ke beech hone chahiye.")
+    if not parts[1].isdigit() or not parts[2].isdigit():
+        await message.reply_text("❌ User ID aur amount dono number hone chahiye.")
+        return
+    target, amount = int(parts[1]), int(parts[2])
+    if amount <= 0:
+        await message.reply_text("❌ Amount 0 se zyada hona chahiye.")
+        return
+    if len(parts) == 3:
+        unit, mult = "day", 86400
+    else:
+        unit = parts[3].strip().lower()
+        mult = {"hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+                "day": 86400, "days": 86400,
+                "month": 30 * 86400, "months": 30 * 86400,
+                "year": 365 * 86400, "years": 365 * 86400}.get(unit)
+        if not mult:
+            await message.reply_text("❌ Unit hour, day, month ya year hona chahiye.")
+            return
+    add_secs = amount * mult
+    if add_secs > 3650 * 86400:
+        await message.reply_text("❌ Premium 3650 din se zyada nahi ho sakta.")
         return
     subs = _load_subs()
     now = time.time()
     cur = subs.get(str(target), {}).get("expiry", 0)
-    subs[str(target)] = {"type": "paid", "expiry": max(now, cur) + days * 86400}
+    new_exp = max(now, cur) + add_secs
+    subs[str(target)] = {"type": "paid", "expiry": new_exp}
     _save_subs(subs)
+    label = f"{amount} {unit}" if len(parts) == 4 else f"{amount} day(s)"
     card = await _premium_card(target, client)
-    await message.reply_text(
-        f"✅ Premium activate ho gaya!\n\n{card}"
-    )
+    await message.reply_text(f"✅ Premium activate ho gaya ({label})!\n\n{card}")
     try:
         await client.send_message(
             target,
-            f"🎉 Tumhe **{days} din** ka premium access mil gaya hai!\n\n{card}\n\n"
+            f"🎉 Tumhe **{label}** ka premium access mil gaya hai!\n\n{card}\n\n"
             "`/login` karke shuru karo.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
     except Exception:
         pass
+
+
+@app.on_message(filters.command("normal") & filters.private)
+async def normal_handler(client, message):
+    """Owner kisi premium user ko normal banaye: /normal <user_id>
+    Paid subscription hatao, par allowed list me rakho, taaki user
+    normal (batch-only) hi rahe, poori tarah blocked na ho."""
+    uid = message.chat.id
+    if not _is_owner(uid):
+        await message.reply_text("⛔ Owner only.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.reply_text("Usage: `/normal <user_id>`")
+        return
+    target = int(parts[1])
+    subs = _load_subs()
+    subs.pop(str(target), None)
+    _save_subs(subs)
+    allowed = _load_allowed()
+    allowed.add(target)
+    _save_allowed(allowed)
+    await message.reply_text(
+        f"✅ `{target}` ab normal user hai.\n"
+        "Wo /batch se save-restriction use kar sakta hai, par /public aur "
+        "/mkchannels jaise premium commands use nahi kar payega.")
 
 
 @app.on_message(filters.command("plan") & filters.private)
@@ -4757,6 +4850,11 @@ async def mkchannels_start_handler(client, message):
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
         return
+    if not _is_premium(message.chat.id):
+        await message.reply_text(
+            "⛔ Ye command sirf premium members ke liye hai.\n"
+            "Normal user /batch se save-restriction use kar sakta hai.")
+        return
     print(f"⚡ Processing /mkchannels for user {message.chat.id}", flush=True)
     ADDCHANNEL_STATES.pop(message.chat.id, None)
     SENDALLRANGE_STATES.pop(message.chat.id, None)
@@ -4829,6 +4927,11 @@ async def sendall_start_handler(client, message):
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
         return
+    if not _is_premium(message.chat.id):
+        await message.reply_text(
+            "⛔ Ye command sirf premium members ke liye hai.\n"
+            "Normal user /batch se save-restriction use kar sakta hai.")
+        return
     print(f"⚡ Processing /sendall for user {message.chat.id}", flush=True)
     ADDCHANNEL_STATES.pop(message.chat.id, None)
     SENDALLRANGE_STATES.pop(message.chat.id, None)
@@ -4864,6 +4967,11 @@ async def addchannel_start_handler(client, message):
         return
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
+        return
+    if not _is_premium(message.chat.id):
+        await message.reply_text(
+            "⛔ Ye command sirf premium members ke liye hai.\n"
+            "Normal user /batch se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /addchannel for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)
@@ -4912,6 +5020,11 @@ async def sendallrange_start_handler(client, message):
         return
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
+        return
+    if not _is_premium(message.chat.id):
+        await message.reply_text(
+            "⛔ Ye command sirf premium members ke liye hai.\n"
+            "Normal user /batch se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /sendallrange for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)
@@ -4982,6 +5095,11 @@ async def public_start_handler(client, message):
         return
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Access denied.")
+        return
+    if not _is_premium(message.chat.id):
+        await message.reply_text(
+            "⛔ Ye command sirf premium members ke liye hai.\n"
+            "Normal user /batch se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /public for user {message.chat.id}", flush=True)
     ADDCHANNEL_STATES.pop(message.chat.id, None)
@@ -6169,6 +6287,10 @@ UPDATE_NOTES = (
     "• /sendall aur /sendallrange — ab bot fallback bhi hai, login account fail ho to bot admin se bhejega (Post Messages ON hona chahiye)\n"
     "• /mkchannels — har naye channel me bot bhi admin banega (Post Messages ON), taaki 1 account se sab par broadcast ho sake; /organize aur /arrange hata diye gaye, folderwise kaam sirf /fbatch se hoga\n"
     "• /mkchannels bio step ka crash fix — bio bhejte hi jo UnboundLocalError aata tha aur flow atak jata tha (isliye DP kabhi lagti hi nahi thi), wo theek hua\n"
+    "• /clone list topics fix — deleted topic milne par poori folder list fail nahi hogi, deleted topics skip ho jayenge\n"
+    "• Premium / Normal system — /public aur channel commands sirf premium members ke liye, normal users /batch use kar sakte hain; /clone me download/upload progress dikhega\n"
+    "• /mkchannels bot admin fix — ab bot ko pehle channel me add karke phir admin banaya jayega, taaki bot admin fail na ho\n"
+    "• /paid aur /allow commands hata diye gaye — premium ke liye /premium, normal ke liye /normal use hoga\n"
 )
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
