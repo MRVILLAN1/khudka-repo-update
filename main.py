@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v64"
+VERSION = "v66"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2677,12 +2677,17 @@ def _mk_split_raw(text):
     return raw
 
 
-async def _mk_create_public_channel(userbot, username, title=None, bio=None):
+async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot_id=None):
     """Ek PUBLIC channel banao + username set karo.
     Title = user ka diya hua common naam (v63), na diya ho to username.
     Bio = user ka diya hua bio (v64), na diya ho to default bio.
     Telegram about max ~255 chars hai, isliye bio ko 255 par kaato.
-    Returns (chat_id, link) ya (None, error_string)."""
+    v66: username set hone ke baad bot ko bhi admin banaya jata hai
+    (Post Messages + Edit Messages ON), taaki baad me /sendall /
+    /sendallrange ka bot fallback (v65) in channels par bhi chale, bina
+    login account ke admin hone ke. Bot admin fail ho to channel nahi
+    delete hota, sirf warning wapas milti hai.
+    Returns (chat_id, link, bot_admin_warn) ya (None, error_string, "")."""
     from pyrogram import raw
     title = (title or username).strip()[:128]
     about = (bio or MKCHANNELS_DEFAULT_BIO).strip()[:255]
@@ -2713,8 +2718,28 @@ async def _mk_create_public_channel(userbot, username, title=None, bio=None):
                 channel=peer))
         except Exception:
             pass
-        return None, str(e)
-    return cid, f"https://t.me/{username}"
+        return None, str(e), ""
+    bot_warn = ""
+    if bot_id:
+        try:
+            from pyrogram.types import ChatPrivileges
+            await userbot.promote_chat_member(
+                cid, bot_id,
+                privileges=ChatPrivileges(
+                    can_post_messages=True,
+                    can_edit_messages=True,
+                    can_delete_messages=False,
+                    can_manage_chat=False,
+                    can_restrict_members=False,
+                    can_promote_members=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False,
+                    can_manage_topics=False,
+                ))
+        except Exception as e:
+            bot_warn = f"bot admin fail: {e}"
+    return cid, f"https://t.me/{username}", bot_warn
 
 
 async def run_mkchannels(client, uid, usernames, status_msg, title=None, bio=None, dp_path=None):
@@ -2741,6 +2766,13 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
     existing = _channels_load(uid)
     by_name = {c.get("username"): c for c in existing if isinstance(c, dict)}
     created, failed = [], []
+    bot_admin_failed = []
+    bot_id = None
+    try:
+        _me = await client.get_me()
+        bot_id = _me.id
+    except Exception:
+        bot_id = None
     for i, username in enumerate(usernames):
         if _ev.is_set():
             failed.append((username, "cancel kar diya gaya"))
@@ -2753,13 +2785,13 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         except Exception:
             pass
         try:
-            cid, res = await _mk_create_public_channel(userbot, username, title=title, bio=bio)
+            cid, res, bot_warn = await _mk_create_public_channel(userbot, username, title=title, bio=bio, bot_id=bot_id)
         except FloodWait as e:
             failed.append((username, f"FloodWait {e.value}s — baaki ruk gaye"))
             print(f"[MKCHANNELS] FloodWait {username}: {e.value}s", flush=True)
             break
         except Exception as e:
-            cid, res = None, str(e)
+            cid, res, bot_warn = None, str(e), ""
         dp_warn = ""
         if cid and dp_path and os.path.exists(dp_path):
             # DP alag call se lagti hai (CreateChannel me photo nahi hoti).
@@ -2770,8 +2802,11 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
             except Exception as e:
                 dp_warn = f" (DP fail: {e})"
         if cid:
+            if bot_warn:
+                bot_admin_failed.append((username, bot_warn))
             entry = {"username": username, "chat_id": cid, "title": (title or username),
-                     "link": res, "dp": "yes" if (dp_path and not dp_warn) else ("fail" if dp_warn else "default")}
+                     "link": res, "dp": "yes" if (dp_path and not dp_warn) else ("fail" if dp_warn else "default"),
+                     "bot_admin": "fail" if bot_warn else "yes"}
             by_name[username] = entry
             created.append(entry)
             _channels_save(uid, list(by_name.values()))
@@ -2822,6 +2857,12 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
             f"🖼️ DP: `{'tumhari photo' if dp_path else 'default (naam ka pehla akshar)'}` • 📝 Bio: `{((bio or MKCHANNELS_DEFAULT_BIO)[:80])}`")
     for c in created:
         done += f"\n• {c.get('title', c['username'])} — @{c['username']} — {c['link']}"
+    if bot_admin_failed:
+        done += f"\n🤖 Bot admin fail hue: `{len(bot_admin_failed)}` channels (in par bot se broadcast nahi hoga, login account se hoga)"
+        for uname, err in bot_admin_failed:
+            done += f"\n• @{uname} — {err}"
+    else:
+        done += "\n🤖 Bot admin: sab naye channels me bot ko admin + Post Messages bana diya gaya hai"
     if failed:
         done += f"\n❌ Fail hue: `{len(failed)}`"
         for uname, err in failed:
@@ -2833,6 +2874,22 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
     await message_reply(status_msg, done)
 
 
+# --- v65 BOT FALLBACK (sendall / sendallrange) ---
+# User ne poochha: bot ko sab channels me admin bana do to kya ho jayega?
+# Jawab: haan, par tabhi jab send bot se bhi try ho. v64 tak /sendall sirf
+# /login wale account (userbot) se bhejta tha — bot admin hone ka koi
+# fayda nahi tha, kyunki bot ko try hi nahi kiya jata tha.
+# v65 me order ye hai, har channel par:
+#   1. userbot copy_message (pehle jaisa, creator/admin hone par chalega)
+#   2. userbot forward_messages fallback
+#   3. BOT copy_message (bot admin + Post Messages permission hone par)
+#   4. BOT forward_messages fallback
+# Bot se bheja hua message channel me bot ke through aayega, content
+# wahi rahega. Bot fallback sirf tab kaam karega jab bot dest channel
+# me admin hai aur Post Messages ON hai; warna wo bhi fail hoga aur
+# report me fail aayega. Login account ka admin hona ab zaroori nahi
+# raha, par pehli koshish abhi bhi userbot se hi hogi (pehle wala
+# behaviour badla nahi hai, sirf fallback juda hai).
 async def run_sendall(client, uid, source_msg, status_msg):
     userbot = await get_userbot(uid)
     if not userbot:
@@ -2860,6 +2917,7 @@ async def run_sendall(client, uid, source_msg, status_msg):
                             "nahi hai (text / photo / video / document chahiye).")
         return
     sent, failed = [], []
+    bot_via = 0
     for ch in channels:
         dest = ch.get("chat_id")
         uname = ch.get("username", "?")
@@ -2868,6 +2926,7 @@ async def run_sendall(client, uid, source_msg, status_msg):
             continue
         ok = False
         err = ""
+        via_bot = False
         try:
             await userbot.copy_message(dest, from_chat, source_msg.id)
             ok = True
@@ -2878,13 +2937,31 @@ async def run_sendall(client, uid, source_msg, status_msg):
                 ok = True
             except Exception as e2:
                 err = str(e2)
+        if not ok:
+            # v65 bot fallback: bot dest me admin + Post Messages ON ho to chalega
+            try:
+                await client.copy_message(dest, source_msg.chat.id, source_msg.id)
+                ok = True
+                via_bot = True
+            except Exception as e:
+                err = str(e)
+                try:
+                    await client.forward_messages(dest, source_msg.chat.id, [source_msg.id])
+                    ok = True
+                    via_bot = True
+                except Exception as e2:
+                    err = str(e2)
         if ok:
             sent.append(uname)
+            if via_bot:
+                bot_via += 1
         else:
             failed.append((uname, err))
         await asyncio.sleep(SENDALL_GAP)
     done = ("✅ **Sendall complete!**\n"
             f"📢 Bhej diya: `{len(sent)}` / `{len(channels)}` channels me")
+    if bot_via:
+        done += f"\n🤖 Bot se bheje: `{bot_via}` channels (login account fail hua, bot admin se kaam hua)"
     if sent:
         done += "\n" + "\n".join(f"• @{u}" for u in sent)
     if failed:
@@ -3058,6 +3135,7 @@ async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, statu
     per_channel = {str(c.get("chat_id")): 0 for c in channels if c.get("chat_id")}
     failed_ch = {}
     total_sends = 0
+    bot_sends = 0
     cancelled = False
     for m in usable:
         if _ev.is_set():
@@ -3073,6 +3151,7 @@ async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, statu
             total_sends += 1
             ok = False
             err = ""
+            via_bot = False
             try:
                 await userbot.copy_message(dest, src_chat, m.id)
                 ok = True
@@ -3083,14 +3162,34 @@ async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, statu
                     ok = True
                 except Exception as e2:
                     err = str(e2)
+            if not ok:
+                # v65 bot fallback: dest me bot admin ho to bot se try karo.
+                # Source private ho aur bot uska member na ho to ye bhi fail
+                # hoga — ye fallback ki limit hai, report me fail aayega.
+                try:
+                    await client.copy_message(dest, src_chat, m.id)
+                    ok = True
+                    via_bot = True
+                except Exception as e:
+                    err = str(e)
+                    try:
+                        await client.forward_messages(dest, src_chat, [m.id])
+                        ok = True
+                        via_bot = True
+                    except Exception as e2:
+                        err = str(e2)
             if ok:
                 per_channel[str(dest)] = per_channel.get(str(dest), 0) + 1
+                if via_bot:
+                    bot_sends += 1
             else:
                 failed_ch[str(dest)] = err
             await asyncio.sleep(SENDALL_GAP)
     done = ("✅ **Sendallrange complete!**\n"
             f"📝 Messages: `{len(usable)}` (skip hue empty: `{skipped}`)\n"
             f"📢 Channels: `{len(channels)}` • Total send: `{total_sends}`")
+    if bot_sends:
+        done += f"\n🤖 Bot fallback se bheje: `{bot_sends}` sends (login account fail hua, bot admin se kaam hua)"
     if cancelled:
         done += "\n🛑 Cancel kar diya gaya — iske baad ke message nahi bheje gaye."
     for ch in channels:
@@ -4521,17 +4620,17 @@ async def help_handler(client, message):
         "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya /batch chala diya, to resume latest batch ka hi hoga.\n"
         "6. /clone — Kisi group ke folders + saari messages ko naye PRIVATE group me copy karo: source group ka link bhejo, naya group tumhare account se banega.\n"
         "7. /create — Naya group banao: pehle group ka naam bhejo, phir topics ke naam ek hi message me (har naam ek line par, ya comma se) bhejo, un naam se folders ban jayenge.\n"
-        "8a. /mkchannels — Public channels banao: /mkchannels likho, pehle NAAM bhejo (sab 10 me ek hi dikhega), phir DP bhejo ya skip karo (default rahega), phir BIO bhejo ya skip karo, phir 10 username ek hi message me bhejo (line ya comma se). Sirf username alag-alag hoga. Naam + DP + bio sab channels par ek saath lag jayenge. Channel tumhare login account se banega.\n"
+        "8a. /mkchannels — Public channels banao: /mkchannels likho, pehle NAAM bhejo (sab 10 me ek hi dikhega), phir DP bhejo ya skip karo (default rahega), phir BIO bhejo ya skip karo, phir 10 username ek hi message me bhejo (line ya comma se). Sirf username alag-alag hoga. Naam + DP + bio sab channels par ek saath lag jayenge. Channel tumhare login account se banega, aur har naye channel me bot ko bhi admin + Post Messages bana diya jayega, taaki baad me bot se bhi broadcast ho sake.\n"
         "8b. /mychannels — Tumhare banaye channels ki list dekho.\n"
-        "8c. /sendall — Ek message sab channels me bhejo: kisi message (video / text / image) par reply karke /sendall likho, ya /sendall likh ke agla message bhejo.\n"
+        "8c. /sendall — Ek message sab channels me bhejo: kisi message (video / text / image) par reply karke /sendall likho, ya /sendall likh ke agla message bhejo. Pehle login account se try hoga, fail ho to bot se try hoga (bot dest me admin + Post Messages ON ho to).\n"
         "8d. /addchannel — Pehle se bana channel jodo: /addchannel likho, phir channel ka link / @username bhejo. Login account us channel ka admin hona chahiye, warna send fail hoga.\n"
-        "8e. /sendallrange — 50 message tak ek saath sab channels me: /sendallrange likho, pehli message ka link bhejo, phir aakhri ka. Audio / video / text sab copy honge, sequencewise.\n"
-        "8. /fbatch — Folderwise batch (yehi /organize aur /arrange ki jagah hai): pehle SOURCE group/channel ka link bhejo, phir DEST group ka link bhejo. Bot naam padh ke topic samjhega, dest me us naam ka folder banayega, aur us naam wali saari cheezein (pdf / text / video / pic) us folder me sequencewise COPY karega. Delete kuch nahi hoga, source waisa ka waisa rahega. Har file par download + upload progress dikhega, jaise /batch me dikhta hai. Dest me sirf bot admin ho to bhi chalega, par duplicate folder se bachne ke liye dest me login account ko sirf member bana do. Dest group me Topics ON hona chahiye.\n"
+        "8e. /sendallrange — 50 message tak ek saath sab channels me: /sendallrange likho, pehli message ka link bhejo, phir aakhri ka. Audio / video / text sab copy honge, sequencewise. Pehle login account se try hoga, fail ho to bot fallback try hoga (bot dest me admin ho to).\n"
+        "8. /fbatch — Folderwise batch (folderwise kaam ke liye ek hi command hai): pehle SOURCE group/channel ka link bhejo, phir DEST group ka link bhejo. Bot naam padh ke topic samjhega, dest me us naam ka folder banayega, aur us naam wali saari cheezein (pdf / text / video / pic) us folder me sequencewise COPY karega. Delete kuch nahi hoga, source waisa ka waisa rahega. Har file par download + upload progress dikhega, jaise /batch me dikhta hai. Dest me sirf bot admin ho to bhi chalega, par duplicate folder se bachne ke liye dest me login account ko sirf member bana do. Dest group me Topics ON hona chahiye.\n"
         "9. /settings — Rename, caption template, word remove/replace, thumbnail, watermark, upload method badlo.\n"
         "10. /plan — Apna plan dekho. /buy — Premium kharido (payment manual UPI hai).\n"
         "11. /cancel — Chal raha kaam roko (batch, clone, create, fbatch — koi bhi). Batch rokne ke baad resume karne ke liye button ya /resume use karo.\n"
         "\n"
-        "Seedha link bhejne par ek file ki copy hogi. /organize aur /arrange ab hata diye gaye hain — unki jagah /fbatch use karo.\n"
+        "Seedha link bhejne par ek file ki copy hogi. Folderwise kaam ke liye sirf /fbatch hai.\n"
         "\n"
         f"Owner: `{OWNER_USERNAME}`"
     )
@@ -4835,22 +4934,6 @@ async def sendallrange_start_handler(client, message):
         "Har send ke beech 2 sec ka gap hai, isliye 50 message * 10 channel\n"
         "ka kaam ~17 min tak chal sakta hai.\n\n"
         "**❌ Cancel:** `/cancel`",
-        parse_mode=enums.ParseMode.MARKDOWN,
-    )
-
-
-@app.on_message(filters.command("organize") & filters.private)
-async def organize_start_handler(client, message):
-    await message.reply_text(
-        "**⚠️ `/organize` hata diya gaya hai.**\n\nAb folderwise kaam ke liye **`/fbatch`** use karo.\nCommand: `/fbatch`",
-        parse_mode=enums.ParseMode.MARKDOWN,
-    )
-
-
-@app.on_message(filters.command("arrange") & filters.private)
-async def arrange_start_handler(client, message):
-    await message.reply_text(
-        "**⚠️ `/arrange` hata diya gaya hai.**\n\nAb folderwise kaam ke liye **`/fbatch`** use karo.\nCommand: `/fbatch`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -6080,6 +6163,8 @@ UPDATE_NOTES = (
     "• /sendallrange — pehli-aakhri link se 50 message tak sab channels me ek saath\n"
     "• /mkchannels — ab 10 channels ka naam ek hi hoga, sirf username alag-alag hoga\n"
     "• /mkchannels — ab DP aur bio bhi poochhega, naam + DP + bio sab channels par ek saath lagega (DP na do to default rahega)\n"
+    "• /sendall aur /sendallrange — ab bot fallback bhi hai, login account fail ho to bot admin se bhejega (Post Messages ON hona chahiye)\n"
+    "• /mkchannels — har naye channel me bot bhi admin banega (Post Messages ON), taaki 1 account se sab par broadcast ho sake; /organize aur /arrange hata diye gaye, folderwise kaam sirf /fbatch se hoga\n"
 )
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
