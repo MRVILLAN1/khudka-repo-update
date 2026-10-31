@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v82"
+VERSION = "v83"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2836,17 +2836,15 @@ def _mk_split_raw(text):
     return raw
 
 
-async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot_id=None, bot_username=None):
+async def _mk_create_public_channel(userbot, username, title=None, bio=None):
     """Ek PUBLIC channel banao + username set karo.
     Title = user ka diya hua common naam (v63), na diya ho to username.
     Bio = user ka diya hua bio (v64), na diya ho to default bio.
     Telegram about max ~255 chars hai, isliye bio ko 255 par kaato.
-    v66: username set hone ke baad bot ko bhi admin banaya jata hai
-    (Post Messages + Edit Messages ON), taaki baad me /sendall /
-    /sendallrange ka bot fallback (v65) in channels par bhi chale, bina
-    login account ke admin hone ke. Bot admin fail ho to channel nahi
-    delete hota, sirf warning wapas milti hai.
-    Returns (chat_id, link, bot_admin_warn) ya (None, error_string, "")."""
+    v83: v64 wala seedha flow wapas — sirf create + username, koi bot
+    admin isme nahi. Bot admin DP lagne ke BAAD loop me alag se hoga,
+    taaki DP creation ke turant baad, pehle jaise, lag sake.
+    Returns (chat_id, link) ya (None, error_string)."""
     from pyrogram import raw
     title = (title or username).strip()[:128]
     about = (bio or "").strip()[:255]  # v79: koi default bio nahi
@@ -2877,11 +2875,8 @@ async def _mk_create_public_channel(userbot, username, title=None, bio=None, bot
                 channel=peer))
         except Exception:
             pass
-        return None, str(e), ""
-    bot_warn = await _bot_make_admin(userbot, cid, bot_id, bot_username)
-    if bot_warn:
-        print(f"[MKCHANNELS] bot admin fail @{username}: {bot_warn}", flush=True)
-    return cid, f"https://t.me/{username}", bot_warn
+        return None, str(e)
+    return cid, f"https://t.me/{username}"
 
 
 async def run_mkchannels(client, uid, usernames, status_msg, title=None, bio=None, dp_path=None):
@@ -2898,59 +2893,6 @@ async def run_mkchannels(client, uid, usernames, status_msg, title=None, bio=Non
             except Exception:
                 pass
 
-
-
-async def _set_channel_photo_verified(userbot, cid, dp_path, username):
-    """Channel ki DP lagao AUR server se verify karo (v81, v82 me verify
-    GetFullChannel se server-fresh hai, get_chat cache se nahi).
-    Pehle set_chat_photo kaam karta dikhta tha par photo lagti hi nahi
-    thi — isliye ab sirf call karna kaafi nahi, get_chat se photo
-    maujood hai ya nahi ye check karna zaroori hai. Dono tareeke
-    (normal + raw EditPhoto) try honge, aur aakhri me verified result
-    milega. Returns (warn_string, ok_bool)."""
-    async def _has_photo():
-        # v82: get_chat kabhi-kabhi cache se purana (bina photo wala)
-        # channel dikha deta hai, isliye verify seedha server se karo:
-        # raw channels.GetFullChannel ka chat_photo hi sach hai.
-        try:
-            await asyncio.sleep(1)
-            from pyrogram import raw as _raw2
-            _peer2 = await userbot.resolve_peer(cid)
-            _full = await userbot.invoke(_raw2.functions.channels.GetFullChannel(channel=_peer2))
-            _fc = getattr(_full, "full_chat", None)
-            _ph = getattr(_fc, "chat_photo", None) if _fc else None
-            return bool(_ph)
-        except Exception as _e:
-            print(f"[MKCHANNELS] DP verify check fail @{username}: {_e}", flush=True)
-            return False
-    _last_err = ""
-    try:
-        await userbot.set_chat_photo(cid, photo=dp_path)
-        print(f"[MKCHANNELS] DP set call ok @{username}, verify kar raha hun", flush=True)
-    except Exception as e:
-        _last_err = str(e)
-        print(f"[MKCHANNELS] DP set fail @{username}: {e} — raw fallback try kar raha hun", flush=True)
-    if not _last_err and await _has_photo():
-        print(f"[MKCHANNELS] DP verified ok @{username}", flush=True)
-        return "", True
-    # Pehli koshish fail hui, ya call to ok thi par photo verify nahi hui —
-    # raw EditPhoto se dobara try karo.
-    try:
-        from pyrogram import raw as _raw
-        _peer = await userbot.resolve_peer(cid)
-        _up = await userbot.save_file(dp_path)
-        await userbot.invoke(_raw.functions.channels.EditPhoto(
-            channel=_peer, photo=_raw.types.InputChatUploadedPhoto(file=_up)))
-        print(f"[MKCHANNELS] DP raw fallback call ok @{username}, verify kar raha hun", flush=True)
-    except Exception as e2:
-        _last_err = (_last_err + " / fallback fail: " + str(e2)) if _last_err else str(e2)
-        print(f"[MKCHANNELS] DP fallback bhi fail @{username}: {e2}", flush=True)
-        return f" (DP fail: {_last_err})", False
-    if await _has_photo():
-        print(f"[MKCHANNELS] DP verified ok via fallback @{username}", flush=True)
-        return "", True
-    print(f"[MKCHANNELS] DP verify fail @{username}: call ok thi par server par photo nahi mili (err: {_last_err})", flush=True)
-    return f" (DP fail: call ok par photo verify nahi hui{(' — ' + _last_err) if _last_err else ''})", False
 
 
 async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=None, bio=None, dp_path=None):
@@ -2988,30 +2930,38 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         except Exception:
             pass
         try:
-            cid, res, bot_warn = await _mk_create_public_channel(userbot, username, title=title, bio=bio, bot_id=bot_id, bot_username=bot_username)
+            cid, res = await _mk_create_public_channel(userbot, username, title=title, bio=bio)
         except FloodWait as e:
             failed.append((username, f"FloodWait {e.value}s — baaki ruk gaye"))
             print(f"[MKCHANNELS] FloodWait {username}: {e.value}s", flush=True)
             break
         except Exception as e:
-            cid, res, bot_warn = None, str(e), ""
+            cid, res = None, str(e)
+        # v83: DP v64 wala seedha tareeka — create + username ke turant
+        # baad, koi verify/fallback/second-pass nahi. DP fail ho to channel
+        # delete mat karo, sirf warning report me de do.
         dp_warn = ""
-        dp_ok = False
-        if cid and dp_path and not os.path.exists(dp_path):
-            dp_warn = " (DP file nahi mili)"
-            print(f"[MKCHANNELS] DP file nahi mili @{username}: {dp_path}", flush=True)
         if cid and dp_path and os.path.exists(dp_path):
-            # DP alag call se lagti hai (CreateChannel me photo nahi hoti).
-            # v81: sirf call karna kaafi nahi — server se verify karo ki
-            # photo lagi ya nahi, warna report me "yes" jhooth bolta.
-            dp_warn, dp_ok = await _set_channel_photo_verified(userbot, cid, dp_path, username)
+            try:
+                await userbot.set_chat_photo(cid, photo=dp_path)
+                print(f"[MKCHANNELS] DP set ok @{username}", flush=True)
+            except Exception as e:
+                dp_warn = f" (DP fail: {e})"
+                print(f"[MKCHANNELS] DP set fail @{username}: {e}", flush=True)
         if dp_warn:
             dp_failed.append((username, dp_warn))
+        # Bot admin DP ke BAAD (v83): pehle DP, phir admin — DP ka rasta
+        # admin step se pehle hi poora ho jaye, bilkul v64 jaisa.
+        bot_warn = ""
+        if cid and bot_id:
+            bot_warn = await _bot_make_admin(userbot, cid, bot_id, bot_username)
+            if bot_warn:
+                print(f"[MKCHANNELS] bot admin fail @{username}: {bot_warn}", flush=True)
         if cid:
             if bot_warn:
                 bot_admin_failed.append((username, bot_warn))
             entry = {"username": username, "chat_id": cid, "title": (title or username),
-                     "link": res, "dp": "yes" if dp_ok else ("fail" if dp_warn else "none"),
+                     "link": res, "dp": "yes" if (dp_path and not dp_warn) else ("fail" if dp_warn else "none"),
                      "bot_admin": "fail" if bot_warn else "yes"}
             by_name[username] = entry
             created.append(entry)
@@ -3056,31 +3006,6 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
                     await safe_edit(status_msg, f"⏳ **Timer khatam, agla channel ban raha hai: `@{usernames[i+1]}`**\n\n📢 Ban gaye: `{len(created)}` / `{len(usernames)}` • Baki: `{len(usernames) - i - 1}`")
                 except Exception:
                     pass
-    # v81 SECOND PASS: pehli baar DP verify na hui ho to run ke aakhir me
-    # (channel banne ke kuch minute baad, jab channel poori tarah ready
-    # hota hai) ek baar phir se DP lagane ki koshish karo.
-    if dp_path and os.path.exists(dp_path) and created:
-        await safe_edit(status_msg, "🖼️ **DP ka aakhri check ho raha hai...**\nJo channels par DP verify nahi hui thi, un par dobara try kar raha hun.")
-        for _entry in created:
-            if _entry.get("dp") == "yes":
-                continue
-            _cid2 = _entry.get("chat_id")
-            _uname2 = _entry.get("username")
-            if not _cid2:
-                continue
-            _w2, _ok2 = await _set_channel_photo_verified(userbot, _cid2, dp_path, _uname2)
-            if _ok2:
-                _entry["dp"] = "yes"
-                by_name[_uname2] = _entry
-                dp_failed = [(u, e) for (u, e) in dp_failed if u != _uname2]
-                print(f"[MKCHANNELS] DP second pass ok @{_uname2}", flush=True)
-            else:
-                _entry["dp"] = "fail"
-                by_name[_uname2] = _entry
-                if _w2 and not any(u == _uname2 for u, _ in dp_failed):
-                    dp_failed.append((_uname2, _w2))
-                print(f"[MKCHANNELS] DP second pass bhi fail @{_uname2}: {_w2}", flush=True)
-        _channels_save(uid, list(by_name.values()))
     _channels_save(uid, list(by_name.values()))
     done = ("✅ **Mkchannels complete!**\n"
             f"📢 Public channels ban gaye: `{len(created)}`\n"
