@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v86"
+VERSION = "v87"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2338,12 +2338,19 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     and info.get("kind") not in ("text", "too_big")
                     and info.get("target_msg")):
                 s = get_settings(owner_id)
+                # v87: private source par bhi prefetch download MAT karo jab
+                # transfer possible ho — warna v86 ka transfer bekar ho jata
+                # hai, download pehle hi ho chuka hota hai. Download sirf tab:
+                # file_id nahi hai, ya settings ko file chahiye, ya ye chat
+                # pehle se transfer-blocked hai (protected source).
+                _src_id = getattr(
+                    getattr(info.get("target_msg"), "chat", None), "id", None)
                 needs_dl = (
-                    fetch_client is not client   # private source: instant fail hoga hi
-                    or not info.get("file_id")
+                    not info.get("file_id")
                     # v49 /public: settings ke liye bhi prefetch download MAT
                     # karo — file file_id se instant jayegi, download bekar hai
                     or (not public_fast and _needs_file(s, info))
+                    or (_src_id in _TRANSFER_BLOCKED_CHATS)
                 )
                 if needs_dl:
                     try:
