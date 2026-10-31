@@ -43,7 +43,14 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v90"
+VERSION = "v91"
+# v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
+# nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
+# download silent kiya tha, par prefetch fail hone par upload_one ka
+# fallback download abhi bhi prog_msg par Downloading ID dikhata tha.
+# v91 me fallback download bhi silent hai (prog_msg=None), upload ki
+# progress abhi bhi prog_msg par UPLOADING ke roop me dikhegi. Download
+# sirf LOG me dikhega, chat me kabhi nahi.
 # v90 FIX (user: direct upload wapas, v1 se audit karke): v41-v89 tak audit
 # me personal delivery hamesha topic copy se PEHLE thi — upload order kabhi
 # toota hi nahi. Chat me DOWNLOAD dikhne ki wajah v51 ka first-file fix tha
@@ -1966,7 +1973,8 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                   "(download pehle se ho chuki)", flush=True)
         else:
             print(f"⬇️ DOWNLOAD chal raha hai msg {info['msg_id']}", flush=True)
-            fp = await download_file(userbot, info, prog_msg, stats, uid, client)
+            # v91: fallback download bhi silent — chat me Downloading ID nahi
+            fp = await download_file(userbot, info, None, stats, uid, client)
         if not fp:
             _clean()
             return False
