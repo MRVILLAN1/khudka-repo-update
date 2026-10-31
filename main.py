@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v81"
+VERSION = "v82"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2901,17 +2901,25 @@ async def run_mkchannels(client, uid, usernames, status_msg, title=None, bio=Non
 
 
 async def _set_channel_photo_verified(userbot, cid, dp_path, username):
-    """Channel ki DP lagao AUR server se verify karo (v81).
+    """Channel ki DP lagao AUR server se verify karo (v81, v82 me verify
+    GetFullChannel se server-fresh hai, get_chat cache se nahi).
     Pehle set_chat_photo kaam karta dikhta tha par photo lagti hi nahi
     thi — isliye ab sirf call karna kaafi nahi, get_chat se photo
     maujood hai ya nahi ye check karna zaroori hai. Dono tareeke
     (normal + raw EditPhoto) try honge, aur aakhri me verified result
     milega. Returns (warn_string, ok_bool)."""
     async def _has_photo():
+        # v82: get_chat kabhi-kabhi cache se purana (bina photo wala)
+        # channel dikha deta hai, isliye verify seedha server se karo:
+        # raw channels.GetFullChannel ka chat_photo hi sach hai.
         try:
             await asyncio.sleep(1)
-            _ch = await userbot.get_chat(cid)
-            return bool(getattr(_ch, "photo", None))
+            from pyrogram import raw as _raw2
+            _peer2 = await userbot.resolve_peer(cid)
+            _full = await userbot.invoke(_raw2.functions.channels.GetFullChannel(channel=_peer2))
+            _fc = getattr(_full, "full_chat", None)
+            _ph = getattr(_fc, "chat_photo", None) if _fc else None
+            return bool(_ph)
         except Exception as _e:
             print(f"[MKCHANNELS] DP verify check fail @{username}: {_e}", flush=True)
             return False
