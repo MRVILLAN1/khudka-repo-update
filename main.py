@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v84"
+VERSION = "v85"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -6708,11 +6708,40 @@ async def _broadcast_update():
 
 
 # --- MAIN ENGINE ---
+async def _telegram_watchdog():
+    """v85: Telegram connection ka watchdog — do baar aaye DC loop ka fix.
+
+    Loop me process zinda rehta hai aur health server 200 deta hai, isliye
+    Koyeb use healthy samajh ke restart nahi karta, aur bot tab tak dead
+    rehta hai jab tak haath se restart/redeploy na karo. Ye watchdog har
+    60 sec me bot client se get_me maangta hai; lagatar 5 baar fail ho
+    (lagbhag 5 min tak Telegram dead) to process khud exit kar deta hai —
+    Koyeb crashed container ko apne aap dobara start karta hai, naya
+    session banta hai, loop toot jata hai. Startup ke pehle 3 min me
+    exit nahi karta (backup restore + broadcast ka waqt).
+    Batch par asar: dead session me batch waise bhi aage nahi badhta,
+    isliye 5 min dead rehne ke baad restart hi sahi raasta hai."""
+    await asyncio.sleep(180)
+    _fails = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.wait_for(app.get_me(), timeout=20)
+            _fails = 0
+        except Exception as _e:
+            _fails += 1
+            print(f"[WATCHDOG] Telegram check fail {_fails}/5: {_e}", flush=True)
+            if _fails >= 5:
+                print("[WATCHDOG] Telegram 5 min se dead hai — process exit kar raha hun, Koyeb fresh restart dega", flush=True)
+                os._exit(1)
+
+
 async def main():
     await start_web_server()
 
     print("🚀 Starting Bot Client...", flush=True)
     await app.start()
+    asyncio.create_task(_telegram_watchdog())
 
     me = await app.get_me()
     try:
