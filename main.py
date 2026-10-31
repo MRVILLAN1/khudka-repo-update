@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v85"
+VERSION = "v86"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -209,6 +209,8 @@ async def _backup_restore_all():
             print(f"backup restore: {fname} OK", flush=True)
         except Exception as e:
             print(f"backup restore {fname} failed: {e}", flush=True)
+
+BOT_USERNAME = None  # v86: transfer fast path ke liye bot ka username (main() me set hota hai)
 
 # Pyrogram Clients Setup
 # workers=16: 100 worker threads per client free plan ki RAM bhi khate hain
@@ -1723,6 +1725,81 @@ async def _direct_fast(client, dest_chat, group_id, topic_id, kind, file_id, cap
     return True
 
 
+# Protected-content chats ("Restrict saving content" ON) jahan Telegram
+# file reference re-send block kar deta hai — unke liye har file par transfer
+# try karna bekar failed calls hain, isliye ek baar pata chalne ke baad skip.
+_TRANSFER_BLOCKED_CHATS = set()
+
+
+def _note_transfer_block(err, src_chat_id):
+    es = str(err).upper()
+    if src_chat_id and ("RESTRICT" in es or "FORWARD" in es):
+        _TRANSFER_BLOCKED_CHATS.add(src_chat_id)
+        print(f"[TRANSFER] chat {src_chat_id} protected hai — is chat ki "
+              "baaki files seedha download se aayengi", flush=True)
+
+
+async def _transfer_fast(client, userbot, dest_chat, group_id, topic_id,
+                         kind, file_id, cap, info):
+    """v86: TRANSFER FAST PATH wapas (v43 wali bot ki khasiyat, v44 me hati thi).
+    Problem: userbot ka fetch kiya file_id BOT use nahi kar sakta (MEDIA_EMPTY),
+    isliye har private file download+upload hoti thi (2x time).
+    Trick: userbot wahi file_id BOT ke PM me bhej deta hai (server-side,
+    instant — koi download nahi), phir bot us message ko user tak COPY kar
+    deta hai (wo bhi server-side instant). Copy me bot ka apna file_id ban
+    jata hai, jisse topic me bhi instant copy hota hai. Returns True/False.
+    Fail ho to caller download+upload fallback par jayega — kuch regress nahi hoga."""
+    if not BOT_USERNAME or userbot is None:
+        return False
+    # Protected chat me pehle hi block ho chuka hai to transfer skip karo
+    src_chat = getattr(info.get("target_msg"), "chat", None)
+    src_chat_id = getattr(src_chat, "id", None)
+    if src_chat_id and src_chat_id in _TRANSFER_BLOCKED_CHATS:
+        return False
+    # 1) userbot file_id BOT ko PM kare (instant)
+    try:
+        sent = await _send_by_file_id(userbot, BOT_USERNAME, kind, file_id, cap, info)
+    except Exception as e:
+        print(f"Transfer send failed ({info['msg_id']}): {e}", flush=True)
+        _note_transfer_block(e, src_chat_id)
+        return False
+    # Bot ke liye transfer chat = userbot wale account ki ID (private chat
+    # har taraf se dusri party ki ID se jaani jaati hai)
+    peer_uid = getattr(sent.from_user, "id", None) if sent.from_user else None
+    if not peer_uid:
+        try:
+            peer_uid = (await userbot.get_me()).id
+        except Exception:
+            return False
+    tmid = sent.id
+    try:
+        # 2) bot transfer message ko COPY karke asli destination de (instant)
+        copied = await client.copy_message(dest_chat, peer_uid, tmid)
+        # 3) topic me bhi — copy se mila BOT ka file_id use karke (instant)
+        bot_fid = _sent_file_id(copied, kind)
+        if group_id and topic_id and bot_fid:
+            await _botapi_send_to_topic(
+                kind, file_id=bot_fid, caption=cap,
+                topic_id=topic_id, info=info)
+        elif group_id and bot_fid:
+            try:
+                await _send_by_file_id(client, group_id, kind, bot_fid, cap, info)
+            except Exception:
+                pass
+        print(f"⚡ INSTANT (transfer) msg {info['msg_id']}", flush=True)
+        return True
+    except Exception as e:
+        print(f"Transfer copy failed ({info['msg_id']}): {e}", flush=True)
+        _note_transfer_block(e, src_chat_id)
+        return False
+    finally:
+        # 4) transfer message hata do — user ke chat me wo dikhna nahi chahiye
+        try:
+            await client.delete_messages(peer_uid, [tmid])
+        except Exception:
+            pass
+
+
 async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None, fast_only=False):
     """Ek file deliver karo: personal (dest_chat) + group topic (LOG_GROUP_ID).
     FAST PATH: file_id se instant bhejo (no download/upload).
@@ -1813,10 +1890,10 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             return False
 
         # === FAST PATH: file_id se INSTANT bhejo (sirf BOT ka apna file_id) ===
-        # v44: transfer/instant-share path HATA DIYA (user demand). Ab instant
-        # sirf tab jab bot khud fetch karta ho (public source) — userbot wale
-        # file_id par bot ke send karne ki koshish hi bekar thi (MEDIA_EMPTY),
-        # isliye private source par seedha download+upload chalta hai.
+        # v86: transfer path WAPAS (v44 me hata tha, user ne wapas maanga —
+        # yehi bot ki khasiyat thi). Userbot wale file_id par bot ka direct
+        # send MEDIA_EMPTY par fail hota hai, isliye private source par pehle
+        # transfer try hoga (neeche), fail ho to download+upload fallback.
         file_id = info.get("file_id")
         # v49 /public: file_id fast path tab bhi jab settings (remove/
         # rename/watermark) lagi hon — caption ke rules upar _make_cap me
@@ -1834,6 +1911,21 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 print(f"[PUBLIC] fast fail ({info['msg_id']}) — slow fallback",
                       flush=True)
             print(f"Fast path failed ({info['msg_id']}) — downloading...",
+                  flush=True)
+        # === TRANSFER FAST PATH: private source, userbot ka file_id ===
+        # Sirf tab jab file ko disk par utarna zaroori na ho (rename /
+        # watermark / thumbnail lagi hon to transfer copy wo nahi kar sakta,
+        # isliye tab seedha slow path). Protected chat par pehli fail ke
+        # baad _transfer_fast khud skip kar dega, baaki files download se.
+        if (file_id and (fast_only or not _needs_file(s, info))
+                and userbot is not None and userbot is not client):
+            ok = await _transfer_fast(
+                client, userbot, dest_chat, group_id, topic_id,
+                kind, file_id, cap, info)
+            if ok:
+                info["delivered_fast"] = True
+                return True
+            print(f"Transfer fast failed ({info['msg_id']}) — downloading...",
                   flush=True)
 
         # === SLOW PATH: download + settings + upload ===
@@ -6744,6 +6836,11 @@ async def main():
     asyncio.create_task(_telegram_watchdog())
 
     me = await app.get_me()
+    # v86: transfer fast path ke liye bot ka username cache karo — userbot
+    # private source wali files is username par PM karta hai (koi bhi account
+    # bot ko PM kar sakta hai, group membership ki zaroorat nahi padti).
+    global BOT_USERNAME
+    BOT_USERNAME = me.username
     try:
         await app.set_bot_commands([
             BotCommand("start", "Bot start karo"),
@@ -6775,6 +6872,10 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
+    if BOT_USERNAME:
+        print(f"👉 TRANSFER FAST PATH: ON (@{BOT_USERNAME}) — private files bhi bina download instant delivery", flush=True)
+    else:
+        print("👉 TRANSFER FAST PATH: OFF (bot username nahi mila)", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
