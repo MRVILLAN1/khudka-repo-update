@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v80"
+VERSION = "v81"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2899,6 +2899,52 @@ async def run_mkchannels(client, uid, usernames, status_msg, title=None, bio=Non
                 pass
 
 
+
+async def _set_channel_photo_verified(userbot, cid, dp_path, username):
+    """Channel ki DP lagao AUR server se verify karo (v81).
+    Pehle set_chat_photo kaam karta dikhta tha par photo lagti hi nahi
+    thi — isliye ab sirf call karna kaafi nahi, get_chat se photo
+    maujood hai ya nahi ye check karna zaroori hai. Dono tareeke
+    (normal + raw EditPhoto) try honge, aur aakhri me verified result
+    milega. Returns (warn_string, ok_bool)."""
+    async def _has_photo():
+        try:
+            await asyncio.sleep(1)
+            _ch = await userbot.get_chat(cid)
+            return bool(getattr(_ch, "photo", None))
+        except Exception as _e:
+            print(f"[MKCHANNELS] DP verify check fail @{username}: {_e}", flush=True)
+            return False
+    _last_err = ""
+    try:
+        await userbot.set_chat_photo(cid, photo=dp_path)
+        print(f"[MKCHANNELS] DP set call ok @{username}, verify kar raha hun", flush=True)
+    except Exception as e:
+        _last_err = str(e)
+        print(f"[MKCHANNELS] DP set fail @{username}: {e} — raw fallback try kar raha hun", flush=True)
+    if not _last_err and await _has_photo():
+        print(f"[MKCHANNELS] DP verified ok @{username}", flush=True)
+        return "", True
+    # Pehli koshish fail hui, ya call to ok thi par photo verify nahi hui —
+    # raw EditPhoto se dobara try karo.
+    try:
+        from pyrogram import raw as _raw
+        _peer = await userbot.resolve_peer(cid)
+        _up = await userbot.save_file(dp_path)
+        await userbot.invoke(_raw.functions.channels.EditPhoto(
+            channel=_peer, photo=_raw.types.InputChatUploadedPhoto(file=_up)))
+        print(f"[MKCHANNELS] DP raw fallback call ok @{username}, verify kar raha hun", flush=True)
+    except Exception as e2:
+        _last_err = (_last_err + " / fallback fail: " + str(e2)) if _last_err else str(e2)
+        print(f"[MKCHANNELS] DP fallback bhi fail @{username}: {e2}", flush=True)
+        return f" (DP fail: {_last_err})", False
+    if await _has_photo():
+        print(f"[MKCHANNELS] DP verified ok via fallback @{username}", flush=True)
+        return "", True
+    print(f"[MKCHANNELS] DP verify fail @{username}: call ok thi par server par photo nahi mili (err: {_last_err})", flush=True)
+    return f" (DP fail: call ok par photo verify nahi hui{(' — ' + _last_err) if _last_err else ''})", False
+
+
 async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=None, bio=None, dp_path=None):
     # v79: koi default DP nahi — dp_path None ho to koi DP nahi lagegi.
     # Jo photo user ne bheji hai, wahi lagegi, pehle jaise.
@@ -2942,37 +2988,22 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         except Exception as e:
             cid, res, bot_warn = None, str(e), ""
         dp_warn = ""
+        dp_ok = False
         if cid and dp_path and not os.path.exists(dp_path):
             dp_warn = " (DP file nahi mili)"
             print(f"[MKCHANNELS] DP file nahi mili @{username}: {dp_path}", flush=True)
         if cid and dp_path and os.path.exists(dp_path):
             # DP alag call se lagti hai (CreateChannel me photo nahi hoti).
-            # DP fail ho to channel delete mat karo — channel + username
-            # ban chuka hai, sirf DP ka warning report me de do.
-            # v78: pehle normal set_chat_photo, fail ho to raw
-            # channels.EditPhoto fallback, taaki method ka farq na roke.
-            try:
-                await userbot.set_chat_photo(cid, photo=dp_path)
-                print(f"[MKCHANNELS] DP set ok @{username}", flush=True)
-            except Exception as e:
-                print(f"[MKCHANNELS] DP set fail @{username}: {e} — raw fallback try kar raha hun", flush=True)
-                try:
-                    from pyrogram import raw as _raw
-                    _peer = await userbot.resolve_peer(cid)
-                    _up = await userbot.save_file(dp_path)
-                    await userbot.invoke(_raw.functions.channels.EditPhoto(
-                        channel=_peer, photo=_raw.types.InputChatUploadedPhoto(file=_up)))
-                    print(f"[MKCHANNELS] DP set ok via fallback @{username}", flush=True)
-                except Exception as e2:
-                    dp_warn = f" (DP fail: {e} / fallback fail: {e2})"
-                    print(f"[MKCHANNELS] DP fallback bhi fail @{username}: {e2}", flush=True)
+            # v81: sirf call karna kaafi nahi — server se verify karo ki
+            # photo lagi ya nahi, warna report me "yes" jhooth bolta.
+            dp_warn, dp_ok = await _set_channel_photo_verified(userbot, cid, dp_path, username)
         if dp_warn:
             dp_failed.append((username, dp_warn))
         if cid:
             if bot_warn:
                 bot_admin_failed.append((username, bot_warn))
             entry = {"username": username, "chat_id": cid, "title": (title or username),
-                     "link": res, "dp": "yes" if (dp_path and not dp_warn) else ("fail" if dp_warn else "default"),
+                     "link": res, "dp": "yes" if dp_ok else ("fail" if dp_warn else "none"),
                      "bot_admin": "fail" if bot_warn else "yes"}
             by_name[username] = entry
             created.append(entry)
@@ -3017,6 +3048,31 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
                     await safe_edit(status_msg, f"⏳ **Timer khatam, agla channel ban raha hai: `@{usernames[i+1]}`**\n\n📢 Ban gaye: `{len(created)}` / `{len(usernames)}` • Baki: `{len(usernames) - i - 1}`")
                 except Exception:
                     pass
+    # v81 SECOND PASS: pehli baar DP verify na hui ho to run ke aakhir me
+    # (channel banne ke kuch minute baad, jab channel poori tarah ready
+    # hota hai) ek baar phir se DP lagane ki koshish karo.
+    if dp_path and os.path.exists(dp_path) and created:
+        await safe_edit(status_msg, "🖼️ **DP ka aakhri check ho raha hai...**\nJo channels par DP verify nahi hui thi, un par dobara try kar raha hun.")
+        for _entry in created:
+            if _entry.get("dp") == "yes":
+                continue
+            _cid2 = _entry.get("chat_id")
+            _uname2 = _entry.get("username")
+            if not _cid2:
+                continue
+            _w2, _ok2 = await _set_channel_photo_verified(userbot, _cid2, dp_path, _uname2)
+            if _ok2:
+                _entry["dp"] = "yes"
+                by_name[_uname2] = _entry
+                dp_failed = [(u, e) for (u, e) in dp_failed if u != _uname2]
+                print(f"[MKCHANNELS] DP second pass ok @{_uname2}", flush=True)
+            else:
+                _entry["dp"] = "fail"
+                by_name[_uname2] = _entry
+                if _w2 and not any(u == _uname2 for u, _ in dp_failed):
+                    dp_failed.append((_uname2, _w2))
+                print(f"[MKCHANNELS] DP second pass bhi fail @{_uname2}: {_w2}", flush=True)
+        _channels_save(uid, list(by_name.values()))
     _channels_save(uid, list(by_name.values()))
     done = ("✅ **Mkchannels complete!**\n"
             f"📢 Public channels ban gaye: `{len(created)}`\n"
