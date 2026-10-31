@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v87"
+VERSION = "v88"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -1912,12 +1912,12 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                       flush=True)
             print(f"Fast path failed ({info['msg_id']}) — downloading...",
                   flush=True)
-        # === TRANSFER FAST PATH: private source, userbot ka file_id ===
-        # Sirf tab jab file ko disk par utarna zaroori na ho (rename /
-        # watermark / thumbnail lagi hon to transfer copy wo nahi kar sakta,
-        # isliye tab seedha slow path). Protected chat par pehli fail ke
-        # baad _transfer_fast khud skip kar dega, baaki files download se.
-        if (file_id and (fast_only or not _needs_file(s, info))
+        # === v88: TRANSFER BAND — direct upload wapas ===
+        # User ne video wala rasta maanga: instant copy nahi, balki
+        # download+upload, aur uploading complete hote hi delivery.
+        # Isliye transfer try hi nahi hoga, seedha slow path chalega.
+        # (_transfer_fast code maujood hai, par v88 me call nahi hoga.)
+        if False and (file_id and (fast_only or not _needs_file(s, info))
                 and userbot is not None and userbot is not client):
             ok = await _transfer_fast(
                 client, userbot, dest_chat, group_id, topic_id,
@@ -2338,19 +2338,17 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     and info.get("kind") not in ("text", "too_big")
                     and info.get("target_msg")):
                 s = get_settings(owner_id)
-                # v87: private source par bhi prefetch download MAT karo jab
-                # transfer possible ho — warna v86 ka transfer bekar ho jata
-                # hai, download pehle hi ho chuka hota hai. Download sirf tab:
-                # file_id nahi hai, ya settings ko file chahiye, ya ye chat
-                # pehle se transfer-blocked hai (protected source).
-                _src_id = getattr(
-                    getattr(info.get("target_msg"), "chat", None), "id", None)
+                # v88: purana pipeline wapas — private source ki agli file
+                # background me download hoti rahegi jab current file upload
+                # ho rahi hogi, taaki user ko video jaisa UPLOADING dikhe,
+                # DOWNLOAD ka lamba wait na dikhe. (v87 me ye prefetch
+                # transfer ke liye band kiya gaya tha, ab transfer band hai.)
                 needs_dl = (
-                    not info.get("file_id")
+                    fetch_client is not client   # private source: upload ke liye file chahiye hi
+                    or not info.get("file_id")
                     # v49 /public: settings ke liye bhi prefetch download MAT
                     # karo — file file_id se instant jayegi, download bekar hai
                     or (not public_fast and _needs_file(s, info))
-                    or (_src_id in _TRANSFER_BLOCKED_CHATS)
                 )
                 if needs_dl:
                     try:
@@ -6879,10 +6877,10 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
-    if BOT_USERNAME:
-        print(f"👉 TRANSFER FAST PATH: ON (@{BOT_USERNAME}) — private files bhi bina download instant delivery", flush=True)
-    else:
-        print("👉 TRANSFER FAST PATH: OFF (bot username nahi mila)", flush=True)
+    # v88: TRANSFER BAND — user ne video wala direct upload wapas maanga
+    # (instant nahi, uploading complete hote hi delivery). Isliye startup
+    # me transfer ON ka dawa nahi, direct upload mode dikhega.
+    print("👉 DIRECT UPLOAD MODE: ON (transfer OFF) — private files download+upload se, uploading complete hote hi delivery", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
