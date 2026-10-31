@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v73"
+VERSION = "v77"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -2910,6 +2910,10 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
     by_name = {c.get("username"): c for c in existing if isinstance(c, dict)}
     created, failed = [], []
     bot_admin_failed = []
+    dp_failed = []
+    # v74: skip DP par default file hi na mile to ye True rahega — pehle
+    # ye chupchaap letter avatar ban jata tha, ab report me warning aayegi.
+    dp_default_missing = (dp_path is None)
     bot_id = None
     bot_username = None
     try:
@@ -2939,6 +2943,8 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         except Exception as e:
             cid, res, bot_warn = None, str(e), ""
         dp_warn = ""
+        if cid and dp_path and not os.path.exists(dp_path):
+            dp_warn = " (DP file nahi mili)"
         if cid and dp_path and os.path.exists(dp_path):
             # DP alag call se lagti hai (CreateChannel me photo nahi hoti).
             # DP fail ho to channel delete mat karo — channel + username
@@ -2947,6 +2953,8 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
                 await userbot.set_chat_photo(cid, photo=dp_path)
             except Exception as e:
                 dp_warn = f" (DP fail: {e})"
+        if dp_warn:
+            dp_failed.append((username, dp_warn))
         if cid:
             if bot_warn:
                 bot_admin_failed.append((username, bot_warn))
@@ -3003,6 +3011,13 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
             f"🖼️ DP: `{'default MR. VILLAIN logo' if _dp_is_default else ('tumhari photo' if dp_path else 'default (naam ka pehla akshar)')}` • 📝 Bio: `{((bio or MKCHANNELS_DEFAULT_BIO)[:80])}`")
     for c in created:
         done += f"\n• {c.get('title', c['username'])} — @{c['username']} — {c['link']}"
+    if dp_default_missing:
+        done += ("\n⚠️ Default DP file server par NAHI mili (default_dp.jpg main.py ke saath deploy nahi hui), "
+                 "isliye in channels par letter avatar raha. File ko main.py ke saath hi deploy karo, phir dobara test karo.")
+    if dp_failed:
+        done += f"\n🖼️ DP fail hue: `{len(dp_failed)}` channels"
+        for uname, err in dp_failed:
+            done += f"\n• @{uname} — {err}"
     if bot_admin_failed:
         done += f"\n🤖 Bot admin fail hue: `{len(bot_admin_failed)}` channels (in par bot se broadcast nahi hoga, login account se hoga)"
         for uname, err in bot_admin_failed:
@@ -6203,8 +6218,13 @@ async def message_dispatcher(client, message):
             # Text aaya hai, photo nahi — sirf skip/default maano, warna dobara photo maango
             if text.strip().lower() in ("skip", "default", "no", "none"):
                 MKCHANNELS_STATES[user_id] = {"step": "WAITING_BIO", "title": MKCHANNELS_STATES[user_id].get("title"), "dp_path": None}
+                if _default_dp_path():
+                    _ddp_warn = "\n\n✅ DP skip ki — **default MR. VILLAIN logo lagega**."
+                else:
+                    _ddp_warn = ("\n\n⚠️ **Default DP file server par nahi mili** — skip par letter avatar lagega. "
+                                 "Logo wali DP chahiye to abhi photo bhejo, ya default_dp.jpg ko main.py ke saath deploy karo.")
                 await message.reply_text(
-                    "**STEP 3/4 — Ab channel ki BIO bhejo**\n"
+                    "**STEP 3/4 — Ab channel ki BIO bhejo**\n" + _ddp_warn + "\n"
                     "Ye bio **sab channels me ek hi** lagegi (max 255 chars).\n"
                     "Jaise: `Dholu Bholu Kids — Learn, Play, Grow Together`\n"
                     "Ya `skip` likho to default bio rahegi.\n\n"
@@ -6216,7 +6236,8 @@ async def message_dispatcher(client, message):
                 "📸 DP ke liye **photo bhejo**, ya `skip` likho to default DP rahega.")
             return
         if _mk_step == "WAITING_BIO":
-            if text.strip().lower() in ("skip", "default", "no", "none"):
+            _bio_skipped = text.strip().lower() in ("skip", "default", "no", "none")
+            if _bio_skipped:
                 bio = MKCHANNELS_DEFAULT_BIO
             else:
                 bio = text.strip()[:255]
@@ -6230,6 +6251,7 @@ async def message_dispatcher(client, message):
                 "har username ek nayi line par, ya comma se alag karke.\n"
                 "Jaise:\n`myfirstchannel`\n`mysecondchannel`\n\n"
                 f"• **Sab channels ka naam ek hi hoga:** `{title}`\n"
+                f"• **Bio:** `{'default bio lagegi' if _bio_skipped else 'tumhari bio lagegi'}`\n"
                 "• Sirf **username alag-alag** hoga.\n"
                 "• Ek run me **max 10** username, har channel ke beech **2 MIN ka gap** hai.\n\n"
                 "**❌ Cancel:** `/cancel`",
@@ -6612,11 +6634,10 @@ async def message_dispatcher(client, message):
 # FloodWait na lage. Ye background task me chalta hai, bot start hone me
 # ya chal rahe batch me der nahi karta.
 UPDATE_BROADCAST = os.environ.get("UPDATE_BROADCAST", "1").strip() != "0"
-# v62: Broadcast me sirf "BOT UPDATED" likhna kaafi nahi tha — user ne bola
-# ki restart hone par ye bhi batana chahiye ki restart KYUN hua aur bot me
-# KYA ADD hua hai. Isliye har version ke saath ye notes update karo, aur
-# _broadcast_update() inhe hi bhejega. Notes HTML me hain (broadcast
-# parse_mode=HTML hai), isliye < > mat likhna, sirf • wali lines.
+# v77: User ne bola deploy ke baad wala lamba broadcast BAND karo, sirf
+# chhota "NEW UPDATE ADDED" message bhejo. Isliye UPDATE_NOTES ab bheja
+# nahi jata — ye sirf code me record ke liye pada hai, broadcast me sirf
+# neeche wala 2-line wala message jata hai.
 UPDATE_NOTES = (
     "• /fbatch aur /public ka fix — pehle NameError aata tha, ab nahi\n"
     "• /mkchannels — 10 username se PUBLIC channel banao, har channel ke beech 2 min ka gap\n"
@@ -6634,6 +6655,8 @@ UPDATE_NOTES = (
     "• /paid aur /allow commands hata diye gaye — premium ke liye /premium, normal ke liye /normal use hoga\n"
     "• /ai (FREE Qwen), /free (ek baar, 10 messages trial), /makeadmin, batch limit 5000, sendallrange limit hata, clone me folder + range, default DP + bio, video format fix\n"
     "• /ai ab premium users bhi use kar sakte hain, normal users nahi\n"
+    "• /mkchannels DP fail ab chhupta nahi — report me DP fail ki line + default_dp.jpg missing ki warning aayegi\n"
+    "• /mkchannels me DP aur bio dono poochhe jayenge, skip par tumhara diya hua default lagega (logo DP + default bio)\n"
 )
 UPDATE_BROADCAST_GAP = float(os.environ.get("UPDATE_BROADCAST_GAP", "1"))
 
@@ -6663,17 +6686,11 @@ async def _broadcast_update():
               flush=True)
         return
     users = _broadcast_user_ids()
-    print(f"[BROADCAST] {len(users)} users ko BOT UPDATED message bhej raha hun",
+    print(f"[BROADCAST] {len(users)} users ko chhota NEW UPDATE ADDED message bhej raha hun",
           flush=True)
     sent = failed = 0
-    text = (
-        "<b>\U0001f504 BOT RESTARTED — naya version deploy hua hai</b>\n\n"
-        "Bot crash nahi hua hai. Naya update live karne ke liye bot ko "
-        "restart kiya gaya hai, isliye chal raha batch ruk gaya hoga.\n\n"
-        "<b>Is update me ye add hua hai:</b>\n"
-        + UPDATE_NOTES +
-        "\n\n<b>Agar tumhara batch ruk gaya ho to dobara /batch bhejo.</b>"
-    )
+    # v77: lamba changelog broadcast BAND — sirf ye chhota message jayega.
+    text = "<b>🔄 NEW UPDATE ADDED</b>\n\nBot update ho gaya hai."
     for uid in users:
         try:
             await app.send_message(uid, text, parse_mode=enums.ParseMode.HTML)
@@ -6733,6 +6750,8 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
+    _ddp = _default_dp_path()
+    print(f"👉 DEFAULT DP: {_ddp if _ddp else 'MISSING — default_dp.jpg main.py ke saath deploy nahi hui, skip par letter avatar lagega'}", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
