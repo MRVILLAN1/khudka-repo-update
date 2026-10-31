@@ -43,7 +43,12 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v88"
+VERSION = "v89"
+# v89 BUILD NOTE: v54 ko base banakar usme ab tak ke saare features merge
+# kiye gaye hain (v55-v88 chain: mkchannels/sendall/clone/premium/free/ai/
+# watchdog/DP-fix/direct-upload). v88 file ko base nahi banaya gaya, v54 par
+# cumulative patch lagaya gaya hai — isliye code v88 jaisa hi nikla, kyunki
+# v88 bhi isi chain se bana hai. Farak sirf version aur ye note hai.
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
