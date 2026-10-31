@@ -43,7 +43,16 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v89"
+VERSION = "v90"
+# v90 FIX (user: direct upload wapas, v1 se audit karke): v41-v89 tak audit
+# me personal delivery hamesha topic copy se PEHLE thi — upload order kabhi
+# toota hi nahi. Chat me DOWNLOAD dikhne ki wajah v51 ka first-file fix tha
+# (pehli file ka download prog_msg par dikhane laga) + v87 ka transfer-skip.
+# Isliye v90 me pehli file ka download bhi background jaisa silent hai:
+# chat me sirf Preparing... phir UPLOADING dikhega, jaise video me hai.
+# Download abhi bhi hota hai (protected ke liye zaroori hai), par uski
+# progress sirf LOG me rahegi, chat me nahi. Speed ka farak nahi, sirf
+# dikhne ka farak hai — download+upload ka time wahi lagega.
 # v89 BUILD NOTE: v54 ko base banakar usme ab tak ke saare features merge
 # kiye gaye hain (v55-v88 chain: mkchannels/sendall/clone/premium/free/ai/
 # watchdog/DP-fix/direct-upload). v88 file ko base nahi banaya gaya, v54 par
@@ -2420,11 +2429,14 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                             pending_holder = None
                     holder = {}
                     holders.append(holder)
-                    # v51 first-file fix: prog_msg PEHLE banao, phir download
-                    # karo. Pehle download prog_msg=None se chupchaap hota
-                    # tha — badi file par user ko 4 min tak kuch nahi dikhta
-                    # tha, lagta tha download start hi nahi hua. Ab download
-                    # progress (5 sec me 1 baar) isi message par dikhega.
+                    # v90: pehli file ka download CHAT par mat dikhao.
+                    # v51 me ye dikhane laga tha, isliye user ko DOWNLOAD
+                    # dikhta tha aur lagta tha uploading toota hai. Ab
+                    # prog_msg sirf Preparing... ke liye banega, download
+                    # prog_msg=None se silent hoga (jaise background wali
+                    # files ka hota hai, log me [DOWNLOAD] line rahegi),
+                    # phir upload_one isi message par UPLOADING dikhayega.
+                    # Video wala look wapas: Preparing... -> UPLOADING -> Done.
                     if prog_msg:
                         try:
                             await prog_msg.delete()
@@ -2437,7 +2449,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     except Exception:
                         prog_msg = None
                     early_prog = True
-                    info = await _prepare(mid, pre, holder, prog_msg)
+                    # v90: _prepare ko prog_msg mat do — download silent rahe
+                    info = await _prepare(mid, pre, holder, None)
                 if cancel_event.is_set():
                     break
                 if info == "PEER_INVALID":
