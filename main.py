@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v83"
+VERSION = "v84"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -384,13 +384,19 @@ async def _bot_make_admin(userbot, cid, bot_id, bot_username):
     Returns warn string ("" = success)."""
     if not bot_id:
         return "bot id nahi mila (get_me fail)"
+    # v84: can_manage_topics Pyrogram 2.0.106 me maujood hi nahi hai —
+    # isi ek galat kwarg se _bot_make_admin har baar TypeError se crash
+    # hota tha. Sirf wahi fields rakho jo 2.0.106 jaanta hai.
     from pyrogram.types import ChatPrivileges
-    _priv = ChatPrivileges(
-        can_post_messages=True, can_edit_messages=True,
-        can_delete_messages=False, can_manage_chat=False,
-        can_restrict_members=False, can_promote_members=False,
-        can_change_info=False, can_invite_users=False,
-        can_pin_messages=False, can_manage_topics=False)
+    try:
+        _priv = ChatPrivileges(
+            can_post_messages=True, can_edit_messages=True,
+            can_delete_messages=False, can_manage_chat=False,
+            can_restrict_members=False, can_promote_members=False,
+            can_change_info=False, can_invite_users=False,
+            can_pin_messages=False)
+    except TypeError:
+        _priv = ChatPrivileges(can_post_messages=True, can_edit_messages=True)
     try:
         await userbot.promote_chat_member(cid, bot_id, privileges=_priv)
         return ""
@@ -2954,7 +2960,10 @@ async def _run_mkchannels_inner(client, uid, usernames, status_msg, _ev, title=N
         # admin step se pehle hi poora ho jaye, bilkul v64 jaisa.
         bot_warn = ""
         if cid and bot_id:
-            bot_warn = await _bot_make_admin(userbot, cid, bot_id, bot_username)
+            try:
+                bot_warn = await _bot_make_admin(userbot, cid, bot_id, bot_username)
+            except Exception as _bae:
+                bot_warn = f"bot admin fail: {_bae}"
             if bot_warn:
                 print(f"[MKCHANNELS] bot admin fail @{username}: {bot_warn}", flush=True)
         if cid:
