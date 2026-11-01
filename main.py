@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v92"
+VERSION = "v93"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -1000,7 +1000,10 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
 # waves). 3 parts se burst aadha, throttle kam trigger hota hai; peak
 # speed thodi kam, par batch zyada steady chalta hai. Env se wapas
 # 6 kar sakte ho (MULTI_PARTS=6), par flood wale session par 3 hi rakho.
-MULTI_PARTS = max(1, min(8, int(os.environ.get("MULTI_PARTS", "3"))))
+# v93: floor 3 — Koyeb env MULTI_PARTS=1 live tha, isliye multi band tha aur
+# har file classic download par naya ExportAuthorization mangti thi (FloodWait).
+# 3 parts = v47 wala safe level (6 se flood badhta hai), delivery order sequential hi rahega.
+MULTI_PARTS = max(3, min(8, int(os.environ.get("MULTI_PARTS", "3"))))
 # v52: 10MB -> 1MB. 2026-10-28 logs me 5-9MB ke BIJZLI PDF (DC4) classic
 # path par ja rahe the, aur classic download_media HAR file par DC4 ko
 # naya auth-export karta hai -> ExportAuthorization FloodWait (121s...).
@@ -1231,7 +1234,7 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
     _refresh_age = int(os.environ.get("REFRESH_AGE_SEC", "1800"))
 
     async def _attempt():
-        if (MULTI_PARTS > 1 and user_client and info.get("target_msg")
+        if (user_client and info.get("target_msg")
                 and info.get("file_id")
                 and (info.get("file_size", 0) or 0) >= MULTI_MIN_SIZE):
             try:
@@ -6918,6 +6921,7 @@ async def main():
     # me transfer ON ka dawa nahi, direct upload mode dikhega.
     print("👉 DIRECT UPLOAD MODE: ON (transfer OFF) — private files download+upload se, uploading complete hote hi delivery", flush=True)
     print("👉 FAIL LOGGING: ON — har failed/skipped msg ID log me reason ke saath aayega", flush=True)
+    print("👉 MULTI: cached media session — ExportAuthorization sirf pehli baar per DC, har file par nahi", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
