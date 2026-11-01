@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v91"
+VERSION = "v92"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -798,8 +798,10 @@ async def fetch_one(user_client, src_chat, msg_id, preloaded=None):
     ya 'MISSING' (chunk me confirm ho gaya ki ye id delete/invalid hai).
     Returns: info dict | None (skip) | 'BREAK' (fatal) | 'OFFLINE' | 'PEER_INVALID'."""
     if not user_client:
+        print(f"[BATCH FAIL] msg {msg_id}: OFFLINE (userbot/login session nahi hai)", flush=True)
         return "OFFLINE"
     if preloaded == "MISSING":
+        print(f"[BATCH FAIL] msg {msg_id}: MISSING (source me delete/khaali/invalid ID hai)", flush=True)
         return None
     if preloaded is not None:
         target_msg = preloaded
@@ -811,6 +813,7 @@ async def fetch_one(user_client, src_chat, msg_id, preloaded=None):
             try:
                 target_msg = await _fetch_with_warmup(user_client, src_chat, msg_id)
                 if not target_msg or target_msg.empty:
+                    print(f"[BATCH FAIL] msg {msg_id}: EMPTY (source me message khaali ya nahi mila)", flush=True)
                     return None
                 break  # success, exit retry loop
             except FloodWait as e:
@@ -851,6 +854,7 @@ def _info_from_msg(target_msg, msg_id):
         if target_msg.text:
             return {"kind": "text", "text": target_msg.text, "msg_id": msg_id,
                     "delivered_fast": True}
+        print(f"[BATCH FAIL] msg {msg_id}: NO MEDIA/TEXT (na media hai, na text hai)", flush=True)
         return None
 
     kind = target_msg.media.value
@@ -1903,6 +1907,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             info["delivered_fast"] = True
             return True
         if kind == "too_big":
+            print(f"[BATCH FAIL] msg {info['msg_id']}: TOO_BIG (2GB se badi file, skip hui)", flush=True)
             await client.send_message(
                 dest_chat,
                 f"⚠️ **Message {info['msg_id']}:** File 2GB se badi hai.",
@@ -2069,6 +2074,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         try:
             sent_msg = await _do_send(dest_chat, None, True)
         except FloodWait as e:
+            print(f"[BATCH FAIL] msg {info.get('msg_id')}: Personal upload FloodWait {e.value}s", flush=True)
             await asyncio.sleep(e.value + 1)
             _clean()
             return False
@@ -2114,6 +2120,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         return True
 
     except FloodWait as e:
+        print(f"[BATCH FAIL] msg {info.get('msg_id')}: Upload FloodWait {e.value}s", flush=True)
         await asyncio.sleep(e.value + 1)
         return False
     except Exception as e:
@@ -2473,6 +2480,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     cancel_event.set()
                     break
                 if info == "OFFLINE" or info is None:
+                    print(f"[BATCH FAIL] msg {mid}: fetch se info nahi mila (reason upar wali [BATCH FAIL] line me hai)", flush=True)
                     async with stats.lock:
                         stats.done += 1
                         stats.fail += 1
@@ -2526,6 +2534,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         stats.ok += 1
                     else:
                         stats.fail += 1
+                if not ok_one:
+                    print(f"[BATCH FAIL] msg {mid}: upload_one False (reason upar wali fail line me hai)", flush=True)
                 _batch_save_progress(owner_id, src_chat, start_id, end_id, mid, public_fast)
                 # Pinned status live update (max 3 sec me 1 baar)
                 await _update_batch_status(status_msg, stats)
@@ -6907,6 +6917,7 @@ async def main():
     # (instant nahi, uploading complete hote hi delivery). Isliye startup
     # me transfer ON ka dawa nahi, direct upload mode dikhega.
     print("👉 DIRECT UPLOAD MODE: ON (transfer OFF) — private files download+upload se, uploading complete hote hi delivery", flush=True)
+    print("👉 FAIL LOGGING: ON — har failed/skipped msg ID log me reason ke saath aayega", flush=True)
     print("👉 MODE: sequential delivery + PIPELINED download (N upload + N+1 download)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
