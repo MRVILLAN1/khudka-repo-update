@@ -41,9 +41,52 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("VILLAN_BOT")
+# v94: reset-loop me Pyrogram har 5s "Send exception: Connection lost"
+# (INFO) aur asyncio "socket.send() raised exception" (WARNING) se log
+# bhar deta hai, asli [BATCH]/[DOWNLOAD] lines dab jati hain. Transport
+# ka shor band karo — session reconnect ki INFO lines abhi bhi dikhengi.
+logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v93"
+# v94 NET-RESILIENCE (2026-11-10, on v93 — baaki sab v93 jaisa hi):
+# 2026-11-09 16:30 ek baar ka reset tha, 2026-11-10 07:53-07:56 lagatar
+# loop tha: ConnectionResetError har ~5s, DC1 reconnect ke 4s baad phir
+# reset. v93 me _fetch_part sirf FloodWait par retry karta tha — reset
+# aate hi multi turant fail, classic bhi usi dead session par fail, file
+# turant fail. v94 me: (1) part-level par reset par 2s/5s backoff + session
+# evict + fresh session ke saath retry, (2) file-level par reset par 8s
+# wait + ek baar dobara try, (3) socket.send / tcp Send-exception ka log
+# shor band taaki [BATCH] lines dikhein. Ye Telegram/Koyeb ka network
+# tootta hua rok nahi sakta — reset ab file ko turant nahi maarta, wo
+# wait karke dobara try karta hai. Happy path, order, MULTI_PARTS=3,
+# sequential delivery — sab v93 jaisa hi.
+# v95 PIN-COPY (2026-11-10, on v94 — baaki sab v94 jaisa hi):
+# User: source channel me jo video/message pinned hai, wo dest channel
+# me bhi pinned ho jaye — public ho ya private, sab me.
+# Kaise: har run shuru me source ke pinned IDs ek baar nikalo
+# (search_messages, PINNED filter — Pyrogram 2.0.106 me
+# get_pinned_messages NAHI hai, isliye yahi tareeka hai), phir har
+# delivered file ke baad check karo: source ID pinned tha to dest me
+# pin karo. Pin pehle userbot (login account, dest ka creator/admin)
+# se, phir bot (Bot API) se. Pin fail ho to delivery fail NAHI hoti,
+# sirf [PIN] log aayega. Scope: /sendall, /sendallrange, /fbatch,
+# /clone — dest CHANNEL/group wale raste. /batch ki personal-chat
+# delivery me pin nahi (wo channel nahi hai, status message pehle se
+# pinned rehta hai). /organize-/arrange purane raste hain, pin wahan
+# is version me nahi — folderwise kaam /fbatch se karo.
+# Bot ko pin ka haq: _bot_make_admin me can_pin_messages True kiya,
+# taaki aage se bane /mkchannels channels me bot bhi pin kar sake.
+# Pehle se bane channels me bot ko pin tabhi milega jab /makeadmin
+# dobara chalakar re-promote karo.
+# v96 (2026-11-10, on v95 — baaki sab v95 jaisa hi):
+# (1) /pin command: /pin -> group/channel link -> kya pin karna hai
+# (message link / ID / plain text, ek line me ek) -> ek-ek karke pin.
+# (2) /batch pin-copy ab dest channel par bhi: settings me chat_id se
+# channel set ho to batch se nikli file, source me pinned thi to dest
+# channel me bhi pin hogi. Personal chat (chat_id nahi set) me pin
+# nahi — wahan status message pehle se pinned rehta hai.
+VERSION = "v96"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -417,7 +460,7 @@ async def _bot_make_admin(userbot, cid, bot_id, bot_username):
             can_delete_messages=False, can_manage_chat=False,
             can_restrict_members=False, can_promote_members=False,
             can_change_info=False, can_invite_users=False,
-            can_pin_messages=False)
+            can_pin_messages=True)  # v95: pin-copy ke liye bot ko bhi pin ka haq do
     except TypeError:
         _priv = ChatPrivileges(can_post_messages=True, can_edit_messages=True)
     try:
@@ -1020,6 +1063,28 @@ MULTI_CHUNK = 1024 * 1024  # 1MB parts (Pyrogram ke get_file jaisa)
 # naya ban jata hai (fallback classic waise hi hai).
 _MEDIA_SESSION_CACHE = {}  # (id(client), dc_id) -> Session
 
+# v94: network-reset pehchano — ye transient hai (FloodWait/406 jaisa
+# permanent nahi), isliye is par retry + backoff banta hai.
+_NET_RESET_MARKERS = (
+    "connection lost", "connection reset", "broken pipe",
+    "connection aborted", "timed out", "timeout", "connection refused",
+)
+
+
+def _is_net_reset_error(e):
+    """Exception ya error-string network reset hai ya nahi."""
+    if e is None:
+        return False
+    if isinstance(e, (ConnectionResetError, BrokenPipeError,
+                      ConnectionAbortedError, TimeoutError,
+                      asyncio.TimeoutError)):
+        return True
+    try:
+        _t = str(e).lower()
+    except Exception:
+        return False
+    return any(m in _t for m in _NET_RESET_MARKERS)
+
 
 async def _stop_session_quietly(sess):
     try:
@@ -1110,6 +1175,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
                     wave_start, min(wave_start + MULTI_PARTS, n_parts)))
 
                 async def _fetch_part(p):
+                    nonlocal session
                     offset = p * MULTI_CHUNK
                     for attempt in range(3):
                         try:
@@ -1123,6 +1189,20 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
                             if attempt == 2:
                                 raise
                             await asyncio.sleep(e.value + 1)
+                        except Exception as e:
+                            # v94: ConnectionReset / BrokenPipe par turant
+                            # fail mat karo — purani dead session hatao,
+                            # 2s phir 5s ruk kar fresh session se retry.
+                            if not _is_net_reset_error(e) or attempt == 2:
+                                raise
+                            _wait = 2 if attempt == 0 else 5
+                            print(f"[NET] part {p} msg {msg_id}: reset "
+                                  f"({e}), {_wait}s ruk kar fresh session "
+                                  f"se retry {attempt + 1}/2", flush=True)
+                            _evict_media_sessions(user_client, dc_id)
+                            await asyncio.sleep(_wait)
+                            session = await _get_media_session(
+                                user_client, dc_id)
                     if isinstance(r, _raw.types.upload.File):
                         return p, r.bytes
                     raise RuntimeError(
@@ -1154,6 +1234,9 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
         # FloodWait transient hai — session cache me hi rehne do. Baaki
         # failure par session stale ho sakta hai, evict kar do.
         if not isinstance(e, FloodWait):
+            if _is_net_reset_error(e):
+                print(f"[NET] multi fail msg {msg_id}: {e} — session "
+                      f"evicted, classic fallback", flush=True)
             _evict_media_sessions(user_client, dc_id)
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1298,6 +1381,30 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
             except Exception:
                 pass
         await asyncio.sleep(_fw + 5)
+        info["download_error"] = None
+        info["file_path"] = None
+        result = await _attempt()
+        if result:
+            return result
+    # v94: network-reset par ek baar 8s wait + dobara try. v93 me sirf
+    # FloodWait ko retry milta tha — reset par file turant fail hoti thi.
+    # _attempt() multi + classic dono phir se try karta hai, aur multi
+    # apne andar session evict karke fresh session lega. Reset agar
+    # minutes tak chale to ye retry bhi fail hoga — file fail count hogi,
+    # batch aage badhega, agla file phir try karega (hang nahi hoga).
+    _err0 = info.get("download_error") or ""
+    if _is_net_reset_error(_err0):
+        print(f"[NET-RETRY] reset par file {msg_id}: 8s wait karke dobara "
+              f"try (error: {_err0[:80]})", flush=True)
+        if prog_msg is not None:
+            try:
+                await safe_edit(
+                    prog_msg,
+                    f"⏳ Connection reset — 8s wait, phir dobara try • ID `{msg_id}`")
+            except Exception:
+                pass
+        _evict_media_sessions(user_client)
+        await asyncio.sleep(8)
         info["download_error"] = None
         info["file_path"] = None
         result = await _attempt()
@@ -1580,7 +1687,7 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
             _cu16 = len(cap_text.encode("utf-16-le")) // 2
             cap_entities = [raw.types.MessageEntityBold(
                 offset=0, length=_cu16)]
-        await client.invoke(raw.functions.messages.SendMedia(
+        _res = await client.invoke(raw.functions.messages.SendMedia(
             peer=peer,
             media=media,
             message=cap_text,
@@ -1588,7 +1695,11 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
             random_id=_rand.randint(1, 2**63 - 1),
             top_msg_id=topic_id,
         ))
-        return True
+        # v95: bheje gaye message ki id wapas do (pin copy ke liye).
+        # Callers sirf truthiness check karte hain, isliye id (int) bhi
+        # True jaisa hi kaam karega; id na mile to pehle jaisa True.
+        _mid = _updates_msg_id(_res)
+        return _mid if _mid else True
     except Exception as e:
         print(f"Raw topic send failed: {e}", flush=True)
         return False
@@ -1744,13 +1855,14 @@ async def _direct_fast(client, dest_chat, group_id, topic_id, kind, file_id, cap
     """Bot ka apna file_id direct bhejo (public source jab bot khud fetch
     karta hai). Returns True/False."""
     try:
-        await _send_by_file_id(client, dest_chat, kind, file_id, cap, info)
+        _sent = await _send_by_file_id(client, dest_chat, kind, file_id, cap, info)
     except Exception as e:
         print(f"Direct fast path failed ({info['msg_id']}): {e}", flush=True)
         return False
     await _fast_group_copy(client, group_id, topic_id, kind, file_id, cap, info)
     print(f"⚡ INSTANT (direct) msg {info['msg_id']}", flush=True)
-    return True
+    # v96: sent id wapas do (batch->channel pin ke liye); na mile to True.
+    return getattr(_sent, "id", None) or True
 
 
 # Protected-content chats ("Restrict saving content" ON) jahan Telegram
@@ -1815,7 +1927,8 @@ async def _transfer_fast(client, userbot, dest_chat, group_id, topic_id,
             except Exception:
                 pass
         print(f"⚡ INSTANT (transfer) msg {info['msg_id']}", flush=True)
-        return True
+        # v96: copied id wapas do (pin ke liye); na mile to True.
+        return getattr(copied, "id", None) or True
     except Exception as e:
         print(f"Transfer copy failed ({info['msg_id']}): {e}", flush=True)
         _note_transfer_block(e, src_chat_id)
@@ -1833,10 +1946,19 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
     FAST PATH: file_id se instant bhejo (no download/upload).
     SLOW PATH: download karo, settings lagao, phir upload karo.
     status_msg = pinned batch status (sirf _update_batch_status).
-    prog_msg = alag per-file progress message (sirf progress_bar)."""
+    prog_msg = alag per-file progress message (sirf progress_bar).
+    v96 PIN-COPY: info["pinned"] ho aur dest channel ho (settings chat_id
+    se set, personal chat nahi) to delivered message dest me bhi pin hoga.
+    Pin fail ho to delivery fail nahi hoti."""
     kind = info["kind"]
     s = get_settings(uid)
     group_id = LOG_GROUP_ID
+    # v96: dest channel hai ya personal chat? chat_id set ho (uid se alag)
+    # to channel/group, warna personal chat — pin sirf channel par.
+    try:
+        _dest_is_channel = int(dest_chat) != int(uid)
+    except Exception:
+        _dest_is_channel = False
     # v43 caption helper: (1) original caption par remove/replace rules,
     # (2) caption template REPLACE nahi — original ke NICHE append hoga,
     # (3) phir bold. Slow path me rename ke baad naye naam se dobara
@@ -1904,10 +2026,13 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
 
         if kind == "text":
             bold_text = _bold_text(apply_text_rules(info["text"], s))
-            await client.send_message(
+            _sent_txt = await client.send_message(
                 dest_chat, bold_text, parse_mode=enums.ParseMode.HTML)
             await _to_group_text(bold_text)
             info["delivered_fast"] = True
+            if info.get("pinned") and _dest_is_channel and _sent_txt:
+                if await _pin_delivered(userbot, client, dest_chat, _sent_txt.id):
+                    info["pinned_done"] = True
             return True
         if kind == "too_big":
             print(f"[BATCH FAIL] msg {info['msg_id']}: TOO_BIG (2GB se badi file, skip hui)", flush=True)
@@ -1935,6 +2060,9 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 kind, file_id, cap, info)
             if ok:
                 info["delivered_fast"] = True
+                if info.get("pinned") and _dest_is_channel and isinstance(ok, int):
+                    if await _pin_delivered(userbot, client, dest_chat, ok):
+                        info["pinned_done"] = True
                 return True
             if fast_only:
                 print(f"[PUBLIC] fast fail ({info['msg_id']}) — slow fallback",
@@ -2086,6 +2214,14 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             _clean()
             return False
 
+        # v96 PIN-COPY (batch->channel): dest channel hai aur source me
+        # pinned tha to dest me bhi pin karo. Personal chat me pin nahi.
+        if info.get("pinned") and _dest_is_channel:
+            try:
+                if await _pin_delivered(userbot, client, dest_chat, sent_msg.id):
+                    info["pinned_done"] = True
+            except Exception:
+                pass
         # group topic delivery (personal ke baad)
         # v24: personal upload se mila BOT ka file_id use karo -> group copy INSTANT
         # (userbot wala file_id bot ke kaam ka nahi -> MEDIA_EMPTY, isliye dobara upload nahi)
@@ -2160,6 +2296,64 @@ async def _pin_status(client, chat_id, msg_id):
         return True
     except Exception as e:
         print(f"[PIN] Pyrogram pin fail: {e}", flush=True)
+    return False
+
+
+def _updates_msg_id(res):
+    """Raw Updates se bheje gaye message ki id nikalo (None = nahi mili)."""
+    try:
+        for u in getattr(res, "updates", []) or []:
+            _m = getattr(u, "message", None)
+            if _m is not None and getattr(_m, "id", None):
+                return int(_m.id)
+    except Exception:
+        pass
+    return None
+
+
+async def _get_pinned_ids(fetch_client, src_chat):
+    """Source chat ke pinned message IDs ka set lao (public/private dono).
+    Pyrogram 2.0.106 me get_pinned_messages NAHI hai, isliye PINNED
+    filter wali search use hoti hai. Fail ho to khaali set — delivery
+    rukegi nahi, sirf pin copy skip hoga. Returns set[int]."""
+    if not fetch_client or src_chat is None:
+        return set()
+    try:
+        _ids = set()
+        async for _m in fetch_client.search_messages(
+                src_chat, filter=enums.MessagesFilter.PINNED, limit=100):
+            if _m and getattr(_m, "id", None):
+                _ids.add(int(_m.id))
+        if _ids:
+            print(f"[PIN] source pinned mile: {sorted(_ids)}", flush=True)
+        return _ids
+    except Exception as e:
+        print(f"[PIN] source pinned list fail: {e}", flush=True)
+        return set()
+
+
+async def _pin_delivered(userbot, bot_client, dest_chat, sent_msg_id):
+    """Dest me bheje gaye message ko pin karo — pehle userbot (login
+    account, dest ka creator/admin), phir bot (Bot API). Pin fail ho to
+    delivery fail NAHI hoti, sirf log me [PIN] fail aayega.
+    Returns True/False."""
+    if not sent_msg_id or not dest_chat:
+        return False
+    if userbot is not None:
+        try:
+            await userbot.pin_chat_message(
+                dest_chat, sent_msg_id, disable_notification=True)
+            print(f"[PIN] dest pin OK via userbot msg {sent_msg_id}", flush=True)
+            return True
+        except Exception as e:
+            print(f"[PIN] userbot pin fail msg {sent_msg_id}: {e}", flush=True)
+    if bot_client is not None:
+        try:
+            if await _pin_status(bot_client, dest_chat, sent_msg_id):
+                print(f"[PIN] dest pin OK via bot msg {sent_msg_id}", flush=True)
+                return True
+        except Exception as e:
+            print(f"[PIN] bot pin fail msg {sent_msg_id}: {e}", flush=True)
     return False
 
 
@@ -2353,6 +2547,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
     topic_id = await get_or_create_topic(userbot, owner_id)
     # v50: user ne jo link diya, wo uske folder me record ho jaye
     await _archive_source_link(client, topic_id, src_chat, start_id, end_id, owner_id)
+    # v96 PIN-COPY (batch->channel): source ke pinned IDs ek baar nikalo
+    # (public/private dono). Fail ho to khaali set — pin skip, batch chalega.
+    _pinned_ids = await _get_pinned_ids(fetch_client, src_chat)
+    _pinned_n = 0
     peer_msg = (
         "❌ Channel not found.\n"
         "• Join it with the logged-in account\n"
@@ -2524,6 +2722,9 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                     pending_holder = h
                 # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
                 # prog_msg = per-file progress (alag message), status_msg = pinned batch
+                # v96: ye file source me pinned thi ya nahi — upload_one ko batao.
+                if isinstance(info, dict):
+                    info["pinned"] = mid in _pinned_ids
                 ok_one = await upload_one(
                     client, fetch_client, owner_id, dest_chat, topic_id,
                     status_msg, info, stats, prog_msg,
@@ -2539,6 +2740,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                         stats.fail += 1
                 if not ok_one:
                     print(f"[BATCH FAIL] msg {mid}: upload_one False (reason upar wali fail line me hai)", flush=True)
+                if isinstance(info, dict) and info.get("pinned_done"):
+                    _pinned_n += 1
                 _batch_save_progress(owner_id, src_chat, start_id, end_id, mid, public_fast)
                 # Pinned status live update (max 3 sec me 1 baar)
                 await _update_batch_status(status_msg, stats)
@@ -2623,10 +2826,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
             await _backup_upload("batch_resume.json", BATCH_RESUME_FILE)
         except Exception:
             pass
-        await safe_edit(
-            status_msg,
-            f"✅ Batch complete\nSuccess: `{ok}` | Failed: `{fail}`",
-        )
+        _done_text = f"✅ Batch complete\nSuccess: `{ok}` | Failed: `{fail}`"
+        if _pinned_n:
+            _done_text += f"\n📌 Pinned copy hue: `{_pinned_n}`"
+        await safe_edit(status_msg, _done_text)
 
 
 
@@ -2761,10 +2964,12 @@ async def _clone_send_text(userbot, dest_peer, topic_id, text):
     if not text:
         return False
     try:
-        await userbot.invoke(raw.functions.messages.SendMessage(
+        _res = await userbot.invoke(raw.functions.messages.SendMessage(
             peer=dest_peer, message=text,
             random_id=_rand.randint(1, 2**63 - 1), top_msg_id=topic_id))
-        return True
+        # v95: id wapas do (pin copy ke liye); na mile to pehle jaisa True.
+        _mid = _updates_msg_id(_res)
+        return _mid if _mid else True
     except Exception as e:
         print(f"[CLONE] text send fail: {e}", flush=True)
         return False
@@ -3200,7 +3405,7 @@ async def _copy_to_channel(client, userbot, dest, src_bot, src_userbot, msg_id, 
     Public source ho to BOT copy pehle (bot public source padh sakta hai, aur
     dest me bot admin hai to userbot ki zaroorat nahi), phir userbot.
     Private source ho to pehle userbot, phir bot fallback (pehle jaisa).
-    Returns (ok, via_bot)."""
+    Returns (ok, via_bot, sent_msg_id) — v95: pin copy ke liye sent id."""
     senders = []
     if public_source:
         senders = [(client, src_bot, True), (userbot, src_userbot, False)]
@@ -3210,16 +3415,18 @@ async def _copy_to_channel(client, userbot, dest, src_bot, src_userbot, msg_id, 
         if sender is None or src is None:
             continue
         try:
-            await sender.copy_message(dest, src, msg_id)
-            return True, via_bot
+            _sent = await sender.copy_message(dest, src, msg_id)
+            return True, via_bot, (getattr(_sent, "id", None) if _sent else None)
         except Exception:
             pass
         try:
-            await sender.forward_messages(dest, src, [msg_id])
-            return True, via_bot
+            _sent = await sender.forward_messages(dest, src, [msg_id])
+            if isinstance(_sent, (list, tuple)):
+                _sent = _sent[0] if _sent else None
+            return True, via_bot, (getattr(_sent, "id", None) if _sent else None)
         except Exception:
             continue
-    return False, False
+    return False, False, None
 
 
 async def run_sendall(client, uid, source_msg, status_msg):
@@ -3250,6 +3457,20 @@ async def run_sendall(client, uid, source_msg, status_msg):
         return
     sent, failed = [], []
     bot_via = 0
+    # v95 PIN-COPY: agar user ne source channel se forward karke bheja hai
+    # to usi original message ka pin check karo (bot-chat message ka pin
+    # nahi — forward_from_chat / forward_from_message_id dekho).
+    _pin_src_chat = None
+    _pin_src_id = None
+    _fwd_chat = getattr(source_msg, "forward_from_chat", None)
+    if _fwd_chat is not None:
+        _pin_src_chat = getattr(_fwd_chat, "id", None)
+        _pin_src_id = getattr(source_msg, "forward_from_message_id", None)
+    _pinned_ids = set()
+    if _pin_src_chat and _pin_src_id:
+        _pinned_ids = await _get_pinned_ids(userbot, _pin_src_chat)
+    _should_pin = bool(_pin_src_id and _pin_src_id in _pinned_ids)
+    _pinned_n = 0
     for ch in channels:
         dest = ch.get("chat_id")
         uname = ch.get("username", "?")
@@ -3258,13 +3479,16 @@ async def run_sendall(client, uid, source_msg, status_msg):
             continue
         # v72 FAST: source bot-chat me hai, isliye bot copy pehle (public fast
         # tareeka), fail ho to userbot. Download/upload kabhi nahi hota.
-        ok, via_bot = await _copy_to_channel(
+        ok, via_bot, _sent_id = await _copy_to_channel(
             client, userbot, dest, source_msg.chat.id, from_chat,
             source_msg.id, public_source=True)
         if ok:
             sent.append(uname)
             if via_bot:
                 bot_via += 1
+            if _should_pin and _sent_id:
+                if await _pin_delivered(userbot, client, dest, _sent_id):
+                    _pinned_n += 1
         else:
             failed.append((uname, "copy/forward fail (bot + userbot dono fail)"))
         await asyncio.sleep(SENDALL_GAP)
@@ -3272,6 +3496,8 @@ async def run_sendall(client, uid, source_msg, status_msg):
             f"📢 Bhej diya: `{len(sent)}` / `{len(channels)}` channels me")
     if bot_via:
         done += f"\n🤖 Bot se bheje: `{bot_via}` channels (login account fail hua, bot admin se kaam hua)"
+    if _pinned_n:
+        done += f"\n📌 Pinned copy hue: `{_pinned_n}` channels me"
     if sent:
         done += "\n" + "\n".join(f"• @{u}" for u in sent)
     if failed:
@@ -3441,6 +3667,9 @@ async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, statu
         await message_reply(status_msg, "❌ Is range me bhejne layak koi message "
                             "nahi mila (empty / deleted / access nahi).")
         return
+    # v95 PIN-COPY: source ke pinned IDs ek baar nikalo (public/private dono).
+    _pinned_ids = await _get_pinned_ids(userbot, src_chat)
+    _pinned_n = 0
     per_channel = {str(c.get("chat_id")): 0 for c in channels if c.get("chat_id")}
     failed_ch = {}
     total_sends = 0
@@ -3462,19 +3691,24 @@ async def _run_sendallrange_inner(client, uid, src_chat, start_id, end_id, statu
             # private source ho to userbot pehle. Copy/forward = server-side
             # instant, koi download/upload nahi hota.
             _is_public_src = isinstance(src_chat, str)
-            ok, via_bot = await _copy_to_channel(
+            ok, via_bot, _sent_id = await _copy_to_channel(
                 client, userbot, dest, src_chat, src_chat, m.id,
                 public_source=_is_public_src)
             if ok:
                 per_channel[str(dest)] = per_channel.get(str(dest), 0) + 1
                 if via_bot:
                     bot_sends += 1
+                if m.id in _pinned_ids and _sent_id:
+                    if await _pin_delivered(userbot, client, dest, _sent_id):
+                        _pinned_n += 1
             else:
                 failed_ch[str(dest)] = "copy/forward fail (bot + userbot dono fail)"
             await asyncio.sleep(SENDALL_GAP)
     done = ("✅ **Sendallrange complete!**\n"
             f"📝 Messages: `{len(usable)}` (skip hue empty: `{skipped}`)\n"
             f"📢 Channels: `{len(channels)}` • Total send: `{total_sends}`")
+    if _pinned_n:
+        done += f"\n📌 Pinned copy hue: `{_pinned_n}`"
     if bot_sends:
         done += f"\n🤖 Bot fallback se bheje: `{bot_sends}` sends (login account fail hua, bot admin se kaam hua)"
     if cancelled:
@@ -4110,6 +4344,9 @@ async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
             except Exception as e:
                 await message_reply(status_msg, f"❌ Dest group resolve nahi hua: {e}\nCheck karo ki bot dest me admin hai.")
                 return
+        # v95 PIN-COPY: source ke pinned IDs ek baar nikalo.
+        _pinned_ids = await _get_pinned_ids(userbot, src_chat)
+        _pinned_n = 0
         copied = failed = skipped = 0
         folder_report = []
         for key in sorted(buckets.keys()):
@@ -4148,18 +4385,25 @@ async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
                     continue
                 if info.get("kind") == "text":
                     sent = False
+                    _sent_id = None
                     try:
                         from pyrogram import raw as _raw2
                         import random as _rand2
-                        await client.invoke(_raw2.functions.messages.SendMessage(
+                        _res2 = await client.invoke(_raw2.functions.messages.SendMessage(
                             peer=dest_peer, message=info["text"],
                             random_id=_rand2.randint(1, 2**63 - 1), top_msg_id=dest_tid))
                         sent = True
+                        _sent_id = _updates_msg_id(_res2)
                     except Exception:
-                        sent = await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]) if userbot_in_dest else False
+                        _sent2 = await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]) if userbot_in_dest else False
+                        sent = bool(_sent2)
+                        _sent_id = _sent2 if isinstance(_sent2, int) else None
                     if sent:
                         copied += 1
                         f_copied += 1
+                        if m.id in _pinned_ids and _sent_id:
+                            if await _pin_delivered(userbot, client, dest_chat, _sent_id):
+                                _pinned_n += 1
                     else:
                         failed += 1
                         f_failed += 1
@@ -4204,6 +4448,11 @@ async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
                 if ok:
                     copied += 1
                     f_copied += 1
+                    # v95 PIN-COPY: source me pinned tha to dest me bhi pin karo.
+                    _sent_id = ok if isinstance(ok, int) else None
+                    if m.id in _pinned_ids and _sent_id:
+                        if await _pin_delivered(userbot, client, dest_chat, _sent_id):
+                            _pinned_n += 1
                     if prog_msg:
                         try:
                             await safe_edit(prog_msg, f"✅ Copied • ID `{m.id}` • {info.get('file_name', 'file')} -> `{tname}`")
@@ -4234,6 +4483,8 @@ async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
                      f"📂 Folders: `{len(buckets)}`\n"
                      f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`\n"
                      "🛡️ **Delete kuch nahi hua** — source waisa ka waisa hai, sirf dest me copy gayi hai.")
+        if _pinned_n:
+            done_text += f"\n📌 Pinned copy hue: `{_pinned_n}`"
         if folder_report:
             done_text += "\n" + "\n".join(folder_report)
         if invite:
@@ -4351,6 +4602,9 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
         for k in buckets:
             if k not in ordered:
                 ordered.append(k)
+        # v95 PIN-COPY: source ke pinned IDs ek baar nikalo.
+        _pinned_ids = await _get_pinned_ids(userbot, src_chat)
+        _pinned_n = 0
         copied = failed = skipped = 0
         for key in ordered:
             msgs = buckets.get(key, [])
@@ -4375,8 +4629,12 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     failed += 1
                     continue
                 if info.get("kind") == "text":
-                    if await _clone_send_text(userbot, dest_peer, dest_tid, info["text"]):
+                    _sent_id = await _clone_send_text(userbot, dest_peer, dest_tid, info["text"])
+                    if _sent_id:
                         copied += 1
+                        if m.id in _pinned_ids and isinstance(_sent_id, int):
+                            if await _pin_delivered(userbot, client, dest_id, _sent_id):
+                                _pinned_n += 1
                     else:
                         failed += 1
                     continue
@@ -4406,6 +4664,11 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     shutil.rmtree(info["tmpdir"], ignore_errors=True)
                 if ok:
                     copied += 1
+                    # v95 PIN-COPY: source me pinned tha to naye group me bhi pin karo.
+                    _sent_id = ok if isinstance(ok, int) else None
+                    if m.id in _pinned_ids and _sent_id:
+                        if await _pin_delivered(userbot, client, dest_id, _sent_id):
+                            _pinned_n += 1
                 else:
                     failed += 1
                 # Flood se bachne ke liye har media file ke baad chhota gap
@@ -4430,6 +4693,8 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                      f"📦 Naya group: `{src_title} Clone`{_filt}\n"
                      f"📂 Folders: `{len(topic_titles) if topics else 1}`\n"
                      f"✅ Copied: `{copied}` | ❌ Failed: `{failed}` | ⏭️ Skipped: `{skipped}`")
+        if _pinned_n:
+            done_text += f"\n📌 Pinned copy hue: `{_pinned_n}`"
         if invite:
             done_text += f"\n🔗 Invite: {invite}"
         if cancel_event.is_set():
@@ -4786,6 +5051,9 @@ async def cancel_handler(client, message):
         hit = True
     if uid in FBATCH_STATES:
         FBATCH_STATES.pop(uid, None)
+        hit = True
+    if uid in PIN_STATES:
+        PIN_STATES.pop(uid, None)
         hit = True
     if uid in MKCHANNELS_STATES:
         _mk_st = MKCHANNELS_STATES.pop(uid, None)
@@ -5354,6 +5622,101 @@ async def mychannels_handler(client, message):
     txt += ("\n\nIn sab me ek message bhejne ke liye: kisi message par reply "
             "karke `/sendall` likho, ya `/sendall` likh ke agla message bhejo.")
     await message.reply_text(txt, parse_mode=enums.ParseMode.MARKDOWN)
+
+
+# --- v96 PIN: /pin — kisi group/channel me messages pin karo ---
+# Flow: /pin -> group/channel link -> kya pin karna hai (ek line me ek)
+# Har line ho sakti hai: message link (t.me/.../123), sirf ID (123),
+# ya plain text (us text wala message dhoondh kar pin karega — sirf
+# tab jab EXACTLY 1 match mile, warna fail list me batayega).
+# v96 text-pin update: text do to us text wale saare messages pin honge
+# (max 10) — sirf 1 match wali shart hata di.
+# Pin pehle userbot (login account) se, phir bot se — _pin_delivered
+# reuse. Pin fail = delivery fail nahi, report me aayega.
+PIN_STATES = {}  # uid -> {"step": "WAITING_GROUP"/"WAITING_ITEMS", "group": chat_id, "title": str}
+
+
+async def run_pin(client, uid, group_chat, status_msg, items):
+    """items: [{"chat": chat_id|None, "msg_id": int|None, "text": str|None, "label": str}]"""
+    userbot = await get_userbot(uid)
+    if not userbot:
+        await message_reply(status_msg, "❌ Pehle `/login` karo — pin tumhare account se hoga.")
+        return
+    pinned, failed = [], []
+    for it in items:
+        _chat = it.get("chat") or group_chat
+        _mid = it.get("msg_id")
+        _label = it.get("label") or str(_mid or it.get("text") or "?")
+        if _mid is None and it.get("text"):
+            # v96 text-pin: us text wale saare messages pin karo (max 10).
+            # Pehle sirf exactly 1 match par pin hota tha — user ne manga
+            # ki text do to wo bhi pin ho, isliye ab jitne mile sab pin honge.
+            try:
+                _found = []
+                async for _m in userbot.search_messages(_chat, query=it["text"], limit=10):
+                    if _m and getattr(_m, "id", None):
+                        _found.append(int(_m.id))
+                if not _found:
+                    failed.append((_label, "text se koi message nahi mila"))
+                    continue
+                _ok_n = 0
+                for _fid in _found:
+                    if await _pin_delivered(userbot, client, _chat, _fid):
+                        _ok_n += 1
+                    await asyncio.sleep(1)
+                if _ok_n:
+                    pinned.append(f"{_label} ({_ok_n} mile)")
+                else:
+                    failed.append((_label, "pin fail — login account/bot ko pin ka haq nahi hai"))
+                continue
+            except Exception as e:
+                failed.append((_label, str(e)))
+                continue
+        if _mid is None:
+            failed.append((_label, "ID/link samajh nahi aaya"))
+            continue
+        if await _pin_delivered(userbot, client, _chat, int(_mid)):
+            pinned.append(_label)
+        else:
+            failed.append((_label, "pin fail — login account/bot ko pin ka haq nahi hai"))
+        await asyncio.sleep(1)
+    done = ("✅ **Pin complete!**\n"
+            f"📌 Pinned: `{len(pinned)}` | ❌ Failed: `{len(failed)}`")
+    if pinned:
+        done += "\n" + "\n".join(f"• {x}" for x in pinned[:20])
+    if failed:
+        done += "\n❌ Fail hue:"
+        for _lab, _err in failed[:20]:
+            done += f"\n• {_lab} — {_err}"
+    await finish_status(status_msg, done)
+
+
+@app.on_message(filters.command("pin") & filters.private)
+async def pin_start_handler(client, message):
+    if not await _has_joined(message.chat.id, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(message.chat.id):
+        await message.reply_text("⛔ Access denied.")
+        return
+    print(f"📌 Processing /pin for user {message.chat.id}", flush=True)
+    ADDCHANNEL_STATES.pop(message.chat.id, None)
+    SENDALLRANGE_STATES.pop(message.chat.id, None)
+    USER_STATES.pop(message.chat.id, None)
+    CLONE_STATES.pop(message.chat.id, None)
+    CREATE_STATES.pop(message.chat.id, None)
+    PUBLIC_STATES.pop(message.chat.id, None)
+    FBATCH_STATES.pop(message.chat.id, None)
+    MKCHANNELS_STATES.pop(message.chat.id, None)
+    SENDALL_STATES.pop(message.chat.id, None)
+    PIN_STATES[message.chat.id] = {"step": "WAITING_GROUP"}
+    await message.reply_text(
+        "**📌 PIN — STEP 1/2**\n\n"
+        "Kis **group/channel** me pin karna hai? Uska **link** bhejo.\n"
+        "Jaise: `https://t.me/mychannel` ya `https://t.me/c/1234567890` ya `@mychannel`\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
 
 
 @app.on_message(filters.command("sendall") & filters.private)
@@ -6417,6 +6780,69 @@ async def message_dispatcher(client, message):
                 f"⚠️ Sirf pehle `{MKCHANNELS_MAX}` username liye hain (limit). Baaki ke liye dobara `/mkchannels` karo.")
         return
 
+    # Pin flow v96: (1) group link -> (2) pin karne wali list -> pin
+    if user_id in PIN_STATES:
+        _pstep = PIN_STATES[user_id].get("step")
+        if _pstep == "WAITING_GROUP":
+            _g = _clone_parse_link(text)
+            if _g is None:
+                _t = text.strip().lstrip("@")
+                if _t.lstrip("-").isdigit():
+                    _g = int(_t)
+                elif re.fullmatch(r"[a-zA-Z0-9_]{4,32}", _t):
+                    _g = _t
+            if _g is None:
+                await message.reply_text("❌ **Invalid link!** Group/channel ka link bhejo (jaise `https://t.me/mychannel` ya `@mychannel`).")
+                return
+            _ub = await get_userbot(user_id)
+            if not _ub:
+                PIN_STATES.pop(user_id, None)
+                await message.reply_text("❌ Pehle `/login` karo — pin tumhare account se hoga.")
+                return
+            try:
+                _ch = await _ub.get_chat(_g)
+                _gid = _ch.id
+                _title = getattr(_ch, "title", None) or str(_gid)
+            except Exception as e:
+                await message.reply_text(f"❌ Group/channel nahi khul raha: {e}\nCheck karo ki tumhara account uska member hai, phir link dobara bhejo.")
+                return
+            PIN_STATES[user_id] = {"step": "WAITING_ITEMS", "group": _gid, "title": _title}
+            await message.reply_text(
+                f"**📌 Group lock ho gaya:** `{_title}`\n\n"
+                "**STEP 2/2 — Kya pin karna hai? Ek hi message me bhejo, comma se ya har line me ek.**\n\n"
+                "Jaise: `123, 456, 789` ya link comma se, ya ek line me ek.\n\n"
+                "Har item ho sakta hai:\n"
+                "• Message link — jaise `https://t.me/mychannel/123`\n"
+                "• Sirf ID — jaise `123`\n"
+                "• Plain text — us text wale saare messages pin honge (max 10), jaise `Maths Chapter 1`\n\n"
+                "**❌ Cancel:** `/cancel`",
+                parse_mode=enums.ParseMode.MARKDOWN,
+            )
+            return
+        if _pstep == "WAITING_ITEMS":
+            _items = []
+            # v96 fix: comma se bhi bhej sakte ho — "123, 456, 789" ya link
+            # comma se, ya ek line me ek. Dono tareeke ek saath bhi chalenge.
+            for _line in re.split(r"[,\n]+", text or ""):
+                _line = _line.strip()
+                if not _line:
+                    continue
+                _cid, _mid = parse_tg_link(_line)
+                if _cid and _mid:
+                    _items.append({"chat": _cid, "msg_id": _mid, "label": _line})
+                elif _line.lstrip("-").isdigit():
+                    _items.append({"chat": None, "msg_id": int(_line), "label": _line})
+                else:
+                    _items.append({"chat": None, "msg_id": None, "text": _line, "label": _line})
+            if not _items:
+                await message.reply_text("❌ Kuch samajh nahi aaya. Message link ya ID bhejo, comma ya line se alag karke.")
+                return
+            _st = PIN_STATES.pop(user_id)
+            status_msg = await message.reply_text(
+                f"📌 **Pin Started!** `{_st.get('title', _st.get('group'))}` me `{len(_items)}` items ek-ek karke pin kar raha hun...")
+            await run_pin(client, user_id, _st.get("group"), status_msg, _items)
+            return
+
     # Sendall flow (text message source): /sendall ke baad bheja gaya text
     if user_id in SENDALL_STATES:
         SENDALL_STATES.pop(user_id, None)
@@ -6899,6 +7325,7 @@ async def main():
             BotCommand("sendall", "Ek message sab channels me bhejo"),
             BotCommand("addchannel", "Pehle se bana channel jodo"),
             BotCommand("sendallrange", "koi limit nahi, sab channels me bhejo"),
+            BotCommand("pin", "Group/channel me messages pin karo"),
             BotCommand("free", "Ek baar, 10 messages ka free trial"),
             BotCommand("ai", "Premium + owner, FREE Qwen se chat"),
             BotCommand("makeadmin", "Saved channels me bot ko admin banao"),
@@ -6927,6 +7354,9 @@ async def main():
     print(f"👉 PACING: FAST_GAP={FAST_GAP}s SLOW_GAP={SLOW_GAP}s PRIVATE_GAP={PRIVATE_GAP}s "
           f"FETCH_CHUNK={FETCH_CHUNK}", flush=True)
     print(f"👉 MULTI_DL: {MULTI_PARTS} parts/file (ek file ke parts parallel, order sequential)", flush=True)
+    print("👉 NET-RESILIENCE: ON — ConnectionReset par part retry (2s/5s) + file retry (8s), session evict + backoff, transport log shor OFF", flush=True)
+    print("👉 PIN-COPY: ON — source pinned message dest channel me bhi pin hoga (sendall/sendallrange/fbatch/clone; public+private)", flush=True)
+    print("👉 PIN-COMMAND: ON — /pin se kisi group/channel me messages pin karo; /batch me chat_id channel ho to pinned copy hoga", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
