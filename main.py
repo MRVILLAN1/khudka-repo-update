@@ -211,7 +211,37 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # likha hoga). Chhota hi hai (v77 rule — lamba changelog nahi jayega).
 # Bullets me latest highlights hain — agle version me yahi line update
 # karni hai.
-VERSION = "v107"
+# v108 (2026-11-18, on v107): UNLIMITED RANGE + SECOND LINK WAPAS.
+# (1) Range UNLIMITED — BATCH_LIMIT (5000) wala check teeno jagah se
+# hata (WAITING_RANGE, direct range-link shortcut, purana /public
+# two-link flow). Free-trial limit (10 messages) waisa hi hai — wo
+# paid model hai, range cap nahi.
+# (2) Dusri LINK wapas — /batch me pehli link (start lock) ke baad
+# dusri message link bhejo to uska message ID aakhri ID ban jayega
+# (purana first-link/second-link flow). Galat source ki link ho to
+# mana kar dega. Clone/group mode me bhi chalegi.
+# (3) t.me/c/ 3-part topic link fix — _parse_channel_input pehle
+# beech wala number (TOPIC id) start maan leta tha; ab AAKHRI number
+# (message id) leta hai. Jaise t.me/c/4384345338/15668/17673 par ab
+# start 17673 lock hoga, 15668 nahi.
+# v109 (2026-11-18, on v108): DEST PROGRESS CARD.
+# (1) Auto-dest (channel/group) me bhi per-file progress card — pehle
+# sirf DM me dikhta tha (Preparing -> UPLOADING -> Done), dest me files
+# chupchaap aa jati thi. Ab dest me bhi wahi card dikhega: live speed,
+# bytes, %, ETA, Message ID — stylish fancy font me.
+# (2) Card me batch counts bhi: File X/Y • ✅ ok • ❌ fail (pinned
+# status me to tha hi, ab per-file card me bhi dikhega — DM + dest dono).
+# (3) run_clone (auto forum group) me dest TOPIC me card: download bhi
+# (speed ke saath) + upload bhi, usi folder ke topic me.
+# Download DM chat me ab bhi SILENT hai (v90/v91 rule) — sirf DEST me
+# dikhta hai. Numbers sab ASLI hain (progress_bar ke real bytes/speed),
+# koi fake speed nahi.
+# v110 (2026-11-18, on v109): ARROW PROGRESS CARD.
+# User ne 20 designs me se ARROW (Design 14) chuna — progress_bar ab
+# wahi design dikhayega, DM + dest dono me. Sab kuch BOLD hai (har line
+# _fancy() se guzarti hai). Bar: ▶ filled, ▷ khaali (10 blocks).
+# Numbers sab asli hain (bytes/speed/ETA/counts) — sirf look badla hai.
+VERSION = "v110"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -274,8 +304,9 @@ AUTO_DEST_FILE = os.path.join(DATA_DIR, "auto_dest.json")
 # v72 /free: ek ID par sirf ek baar, 10 messages ka trial.
 FREE_FILE = os.path.join(DATA_DIR, "free_used.json")
 FREE_LIMIT = 10
-# v72: Ek batch me max 5000 posts (user ne 5000 bola hai). Purana
-# Koyeb env BATCH_LIMIT=1000 ho to bhi 5000 hi chalega — fixed hai.
+# v72: Ek batch me max 5000 posts tha (user ne 5000 bola tha).
+# v108: range UNLIMITED kar diya — ye constant ab use nahi hota, sirf
+# record ke liye pada hai (free-trial limit alag hai, wo waisa hi hai).
 BATCH_LIMIT = 5000
 # v40 SPEED: file delivery pacing. Fast path (file_id/copy, instant) ke baad
 # chhota gap, slow path (download+upload) ke baad bada gap. Dono env se
@@ -817,7 +848,7 @@ async def _premium_card(uid, bot_client=None):
 
 async def progress_bar(
     current, total, message, start_time, last_update, action_title,
-    stats=None, uid=None, bot_client=None
+    stats=None, uid=None, bot_client=None, dest_msg=None
 ):
     """Premium style progress bar (screenshot wala design)."""
     now = time.time()
@@ -829,9 +860,12 @@ async def progress_bar(
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
 
-    # 🟥 Squares wala progress bar (10 blocks)
+    # v110: ARROW design (user ne 20 me se chuna) — sab kuch BOLD.
+    # Bar: ▶ filled, ▷ khaali (10 blocks). Har line _fancy() se guzarti
+    # hai, isliye saare akshar + number bold dikhte hain. Numbers sab
+    # asli hain (bytes/speed/ETA/counts) — sirf look badla hai.
     filled = int(percentage // 10)
-    sq_bar = ("🟥 " * filled + "⬜ " * (10 - filled)).strip()
+    _bar = "▶" * filled + "▷" * (10 - filled)
 
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
@@ -843,21 +877,23 @@ async def progress_bar(
     # UPLOADING ya DOWNLOADING
     op = "UPLOADING" if "Upload" in (action_title or "") else "DOWNLOADING"
 
-    # ━━━ SHORT PROGRESS BAR (sirf download/upload ke liye) ━━━
-    # Batch line aur premium card YAHAN nahi — wo alag pinned status me hai
     lines = [
-        op,
+        _fancy(f"➤ {op} ➤ {percentage:.0f}%"),
         "",
-        sq_bar,
-        "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣",
-        f"┣⪼ 🗂️ : {humanbytes(current)} | {humanbytes(total)}",
-        f"┣⪼ ⏳️ : {percentage:.1f}%",
-        f"┣⪼ 🚀 : {humanbytes(speed)}/s",
-        f"┣⪼ ⏱️ : {time_formatter(time_left * 1000)}",
-        f"┣⪼Message ID: {mid_str}",
-        "╰━━━━━━━━━━━━━━━➣",
+        _bar,
+        _fancy(f"➤ Size: {humanbytes(current)} / {humanbytes(total)}"),
+        _fancy(f"➤ Speed: {humanbytes(speed)}/s"),
+        _fancy(f"➤ ETA: {time_formatter(time_left * 1000)}"),
+        _fancy(f"➤ ID: {mid_str}"),
     ]
-    await safe_edit(message, "\n".join(lines))
+    if stats is not None and getattr(stats, "total", 0):
+        _cur = min(stats.done + 1, stats.total)
+        lines.append(_fancy(
+            f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ❌ {stats.fail}"))
+    _text = "\n".join(lines)
+    await safe_edit(message, _text)
+    if dest_msg is not None:
+        await safe_edit(dest_msg, _text)
 
 
 def parse_tg_link(link: str):
@@ -1696,7 +1732,8 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
 # Pyrogram 2.0.106 ke high-level send_* me top_msg_id nahi hai, isliye
 # forum topic me bhejne ke liye raw messages.SendMedia use karna padta hai.
 async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
-                             file_path=None, caption="", info=None, thumb=None, prog_msg=None):
+                             file_path=None, caption="", info=None, thumb=None, prog_msg=None,
+                             stats=None):
     """Topic me media bhejo (raw API, top_msg_id se).
     file_id diya to server-side instant, file_path diya to upload karke.
     Returns True/False."""
@@ -1729,7 +1766,7 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                     file_path, progress=progress_bar,
                     progress_args=(
                         prog_msg, _up_start, _up_last,
-                        f"🚀 Uploading • ID `{info.get('msg_id')}`"))
+                        f"🚀 Uploading • ID `{info.get('msg_id')}`", stats))
             else:
                 uploaded = await client.save_file(file_path)
             mime, _ = mimetypes.guess_type(file_path)
@@ -2044,12 +2081,13 @@ async def _transfer_fast(client, userbot, dest_chat, group_id, topic_id,
             pass
 
 
-async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None, fast_only=False):
+async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None, fast_only=False, dest_prog_msg=None):
     """Ek file deliver karo: personal (dest_chat) + group topic (LOG_GROUP_ID).
     FAST PATH: file_id se instant bhejo (no download/upload).
     SLOW PATH: download karo, settings lagao, phir upload karo.
     status_msg = pinned batch status (sirf _update_batch_status).
     prog_msg = alag per-file progress message (sirf progress_bar).
+    dest_prog_msg = v109: dest (auto channel/group) me bhi wahi card.
     v96 PIN-COPY: info["pinned"] ho aur dest channel ho (settings chat_id
     se set, personal chat nahi) to delivered message dest me bhi pin hoga.
     Pin fail ho to delivery fail nahi hoti."""
@@ -2163,6 +2201,13 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 kind, file_id, cap, info)
             if ok:
                 info["delivered_fast"] = True
+                # v109: fast path me upload callback nahi chalta — dono
+                # cards ko "Sent" par le jao, warna "Preparing…" atka rahega.
+                _done = f"✅ {_fancy('Sent')} • ID `{info.get('msg_id')}`"
+                if prog_msg is not None:
+                    await safe_edit(prog_msg, _done)
+                if dest_prog_msg is not None:
+                    await safe_edit(dest_prog_msg, _done)
                 if info.get("pinned") and _dest_is_channel and isinstance(ok, int):
                     if await _pin_delivered(userbot, client, dest_chat, ok):
                         info["pinned_done"] = True
@@ -2264,7 +2309,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 pa = (prog_msg, start_time, last_update)
                 title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
                 prog = {"progress": progress_bar,
-                        "progress_args": pa + (title, stats, uid, client)}
+                        "progress_args": pa + (title, stats, uid, client, dest_prog_msg)}
             else:
                 prog = {}
             if send_kind == "video":
@@ -2307,6 +2352,15 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         # personal delivery (progress ke saath)
         try:
             sent_msg = await _do_send(dest_chat, None, True)
+            # v109: photo/voice/video_note par upload callback nahi chalta
+            # (progress sirf video/document/audio par) — dono cards ko
+            # "Sent" par le jao, warna "Preparing…" atka rahega.
+            if send_kind in ("photo", "voice", "video_note"):
+                _done2 = f"✅ {_fancy('Sent')} • ID `{info.get('msg_id')}`"
+                if prog_msg is not None:
+                    await safe_edit(prog_msg, _done2)
+                if dest_prog_msg is not None:
+                    await safe_edit(dest_prog_msg, _done2)
         except FloodWait as e:
             print(f"[BATCH FAIL] msg {info.get('msg_id')}: Personal upload FloodWait {e.value}s", flush=True)
             await asyncio.sleep(e.value + 1)
@@ -2615,9 +2669,11 @@ def _parse_channel_input(text):
         return None, None
     # t.me/c/... PEHLE check karo — parse_tg_link 'c' ko username samajh
     # leta hai, isliye private group link (t.me/c/ID) galat parse hota.
-    m = re.search(r"t\.me/c/(\d+)(?:/(\d+))?", t)
+    # t.me/c/CHAT/TOPIC/MSG (topic link) me message ID AAKHRI number hai.
+    m = re.search(r"t\.me/c/(\d+)((?:/\d+)*)", t)
     if m:
-        return int(f"-100{m.group(1)}"), (int(m.group(2)) if m.group(2) else None)
+        _nums = [m.group(1)] + [x for x in m.group(2).split("/") if x]
+        return int(f"-100{_nums[0]}"), (int(_nums[-1]) if len(_nums) > 1 else None)
     cid, mid = parse_tg_link(t)
     if cid and mid:
         return cid, mid
@@ -2871,6 +2927,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
             # Pehli koshish fail hui ho to ek baar aur try karo
             pinned = await _pin_status(client, owner_id, status_msg.id)
         prog_msg = None
+        dest_prog_msg = None  # v109: dest (auto channel/group) ka progress card
         holders = []        # prefetch holders (cleanup ke liye) — LIST, set nahi!
         pending_task = None  # background prepare task (agli file ka)
         pending_mid = None
@@ -2956,6 +3013,20 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                             parse_mode=enums.ParseMode.MARKDOWN)
                     except Exception:
                         prog_msg = None
+                    # v109: dest (auto channel/group) me bhi progress card.
+                    if dest_prog_msg:
+                        try:
+                            await dest_prog_msg.delete()
+                        except Exception:
+                            pass
+                    dest_prog_msg = None
+                    if dest_chat != owner_id:
+                        try:
+                            dest_prog_msg = await client.send_message(
+                                dest_chat, "⏳ Preparing…",
+                                parse_mode=enums.ParseMode.MARKDOWN)
+                        except Exception:
+                            dest_prog_msg = None
                     early_prog = True
                     # v90: _prepare ko prog_msg mat do — download silent rahe
                     info = await _prepare(mid, pre, holder, None)
@@ -3012,6 +3083,20 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                             parse_mode=enums.ParseMode.MARKDOWN)
                     except Exception:
                         prog_msg = None
+                    # v109: dest (auto channel/group) me bhi progress card.
+                    if dest_prog_msg:
+                        try:
+                            await dest_prog_msg.delete()
+                        except Exception:
+                            pass
+                    dest_prog_msg = None
+                    if dest_chat != owner_id:
+                        try:
+                            dest_prog_msg = await client.send_message(
+                                dest_chat, "⏳ Preparing…",
+                                parse_mode=enums.ParseMode.MARKDOWN)
+                        except Exception:
+                            dest_prog_msg = None
                 # v44 PIPELINE: is file ke UPLOAD ke dauraan agli file ka
                 # download background me shuru kar do (order same rahega)
                 if (pending_task is None and ci + 1 < len(chunk)
@@ -3040,7 +3125,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                 ok_one = await upload_one(
                     client, fetch_client, owner_id, dest_chat, topic_id,
                     status_msg, info, stats, prog_msg,
-                    fast_only=public_fast)
+                    fast_only=public_fast, dest_prog_msg=dest_prog_msg)
                 # Memory: inline-prepared file ka holder ab zaroorat nahi
                 if 'holder' in locals():
                     _drop_holder(holders, holder)
@@ -4948,6 +5033,9 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
         _pinned_ids = await _get_pinned_ids(userbot, src_chat)
         _pinned_n = 0
         copied = failed = skipped = 0
+        # v109: dest topic card ke counts ke liye BatchStats.
+        _cstats = BatchStats(total_msgs)
+        _dprog = None  # v109: dest topic ka per-file progress card
         for key in ordered:
             msgs = buckets.get(key, [])
             if not msgs:
@@ -4988,9 +5076,31 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     f"⬇️ **Download ho raha hai:** `{info.get('file_name') or m.id}` "
                     f"({_fi}/{len(_folder_msgs)})\n"
                     f"Total ab tak: ✅ {copied} | ❌ {failed}")
-                fp = await download_file(userbot, info, None, None, uid, client)
+                # v109: dest topic me bhi progress card — download (speed)
+                # + upload (speed) dono usi folder ke topic me dikhenge.
+                _cstats.done = copied + failed + skipped
+                _cstats.ok = copied
+                _cstats.fail = failed
+                if _dprog is not None:
+                    try:
+                        await _dprog.delete()
+                    except Exception:
+                        pass
+                _dprog = None
+                try:
+                    _dprog = await userbot.send_message(
+                        dest_id, "⏳ Preparing…",
+                        reply_to_message_id=dest_tid)
+                except Exception:
+                    _dprog = None
+                fp = await download_file(userbot, info, _dprog, _cstats, uid, client)
                 if not fp:
                     failed += 1
+                    if _dprog is not None:
+                        try:
+                            await safe_edit(_dprog, f"❌ Download fail • ID `{m.id}`")
+                        except Exception:
+                            pass
                     if info.get("tmpdir"):
                         shutil.rmtree(info["tmpdir"], ignore_errors=True)
                     continue
@@ -5001,7 +5111,8 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     f"Total ab tak: ✅ {copied} | ❌ {failed}")
                 ok = await _raw_send_to_topic(
                     userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
-                    caption=info.get("caption") or "", info=info)
+                    caption=info.get("caption") or "", info=info,
+                    prog_msg=_dprog, stats=_cstats)
                 if info.get("tmpdir"):
                     shutil.rmtree(info["tmpdir"], ignore_errors=True)
                 if ok:
@@ -5013,6 +5124,11 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                             _pinned_n += 1
                 else:
                     failed += 1
+                    if _dprog is not None:
+                        try:
+                            await safe_edit(_dprog, f"❌ Upload fail • ID `{m.id}`")
+                        except Exception:
+                            pass
                 # v105 SPEED: gap 2s -> 1s (FloodWait retry pehle se hai — backstop waisa hi)
                 await asyncio.sleep(1)
             if cancel_event.is_set():
@@ -5958,10 +6074,13 @@ async def help_handler(client, message):
         "• v105 — Speed: auto-dest channel/group par private batch ka 10s gap hata (personal chat par waisa hi); clone/fbatch gap 2s -> 1s.\n"
         "• v106 — /buy direct: button dabate hi owner ka chat khulega, message pehle se likha hoga (bold me).\n"
         "• v107 — Restart message stylish: update ka message ab fancy + sundar aayega.\n"
+        "• v108 — Range UNLIMITED (5000 wala cap hata); dusri link se end ID (pehli link phir dusri link wala flow wapas); topic link ka start fix.\n"
+        "• v109 — Dest progress card: auto channel/group me bhi uploading + speed + File X/Y dikhega (stylish).\n"
+        "• v110 — Progress card ARROW design (20 me se chuna): sab kuch bold, ▶/▷ bar.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
-        "3. /batch — EK HI COMMAND (UNIFIED): source ka LINK bhejo (message link, channel/group link — ya Channel ID / @username bhi chalega). Bot khud pehchan lega — public channel ho to FAST copy, private ho to userbot se, folder wala group ho to poochhega: `extract` ya `clone`. Phir folder ka naam ya `all`, phir range (jaise 100-500, ek number, ya `all`). CHANNEL se niklega to tumhare liye ek alag PRIVATE channel banega; GROUP se niklega to ek alag PRIVATE group banega (folderwise — source jaisi hi folders banengi, files wahi jayengi, plain group ki files General me jayengi). Ek ID par ek channel + ek group hi banega, dobara nahi banega — bot dono me auto-admin hoga, aur source me pinned ho to wahan bhi pin hoga. Auto-dest ke liye `/login` zaroori hai, warna personal chat me jayega. Files ek-ek karke, sequencewise aayengi, har file par download + upload progress dikhega.\n"
+        "3. /batch — EK HI COMMAND (UNIFIED): source ka LINK bhejo (message link, channel/group link — ya Channel ID / @username bhi chalega). Bot khud pehchan lega — public channel ho to FAST copy, private ho to userbot se, folder wala group ho to poochhega: `extract` ya `clone`. Phir folder ka naam ya `all`, phir range: `100-500` likho, dusri message ki LINK bhejo (uska ID aakhri ID ban jayega), ek number likho, ya `all` likho — range UNLIMITED hai, koi 5000 wali limit nahi. CHANNEL se niklega to tumhare liye ek alag PRIVATE channel banega; GROUP se niklega to ek alag PRIVATE group banega (folderwise — source jaisi hi folders banengi, files wahi jayengi, plain group ki files General me jayengi). Ek ID par ek channel + ek group hi banega, dobara nahi banega — bot dono me auto-admin hoga, aur source me pinned ho to wahan bhi pin hoga. Auto-dest ke liye `/login` zaroori hai, warna personal chat me jayega. Files ek-ek karke, sequencewise aayengi, har file par download + upload progress dikhega.\n"
         "4. /public — Hata diya gaya hai. Sab kuch /batch se hota hai: /batch likho, public channel ID do, fast copy khud hoga.\n"
         "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya /batch chala diya, to resume latest batch ka hi hoga.\n"
         "6. /clone — Hata diya gaya hai. Sab kuch /batch se hota hai: folder wale group se /batch karo, phir `clone` chuno — naya PRIVATE group tumhare account se banega, folders ke saath.\n"
@@ -7643,9 +7762,7 @@ async def message_dispatcher(client, message):
             start_id, end_id = end_id, start_id
 
         total_files = end_id - start_id + 1
-        if total_files > BATCH_LIMIT:
-            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
-            return
+        # v108: range UNLIMITED — BATCH_LIMIT check hata diya gaya hai.
 
         status_msg = await message.reply_text(
             f"Public fast started — `{total_files}` items."
@@ -7712,7 +7829,8 @@ async def message_dispatcher(client, message):
             f"Source: `{_cname}` ({_ctype})\n"
             f"{_range_hint}"
             "Message ID range bhejo, jaise **`100-500`**\n"
-            "Ya **`all`** likho to poori history nikalegi.\n"
+            "Ya dusri message ki **link** bhejo — uska ID aakhri ID ban jayega.\n"
+            "Ya **`all`** likho to poori history nikalegi (koi limit nahi).\n"
             "(Ek number, jaise `100`, ka matlab hai 100 se aakhri tak.)\n\n"
             "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
@@ -7767,7 +7885,8 @@ async def message_dispatcher(client, message):
             "**📦 Batch — STEP 2/2 — Range bhejo**\n\n"
             f"{_range_hint}"
             "Message ID range bhejo, jaise **`100-500`**\n"
-            "Ya **`all`** likho to poori history nikalegi.\n"
+            "Ya dusri message ki **link** bhejo — uska ID aakhri ID ban jayega.\n"
+            "Ya **`all`** likho to poori history nikalegi (koi limit nahi).\n"
             "(Ek number, jaise `100`, ka matlab hai 100 se aakhri tak.)\n\n"
             "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
@@ -7780,10 +7899,27 @@ async def message_dispatcher(client, message):
     ):
         # v98 UNIFIED BATCH step 2: range -> run_batch (public/private/folder auto).
         _st = USER_STATES[user_id]
-        _start, _end, _is_all = _parse_batch_range(text, _st.get("preset_start"))
+        # v108: dusri LINK bhi chalegi — pehli link (start lock) ke baad
+        # dusri message link bhejo to uska message ID aakhri ID ban jayega
+        # (purana first-link/second-link flow wapas). Galat source ki
+        # link ho to mana kar dega.
+        _link_mid = None
+        if "t.me/" in (text or ""):
+            _lc, _link_mid = _parse_channel_input(text)
+            if _link_mid and isinstance(_lc, int) and isinstance(_st.get("chat_id"), int) and _lc != _st["chat_id"]:
+                await message.reply_text("❌ Dusri link pehli wali source ki honi chahiye.")
+                return
+        if _link_mid:
+            _start = _st.get("preset_start")
+            _end = _link_mid
+            _is_all = False
+            if _start is None:
+                _start, _end, _is_all = _link_mid, None, True
+        else:
+            _start, _end, _is_all = _parse_batch_range(text, _st.get("preset_start"))
         if _start is None:
             await message.reply_text(
-                "❌ Range samajh nahi aaya. Jaise `100-500` bhejo, ya `all` likho.")
+                "❌ Range samajh nahi aaya. Jaise `100-500` bhejo, dusri link bhejo, ya `all` likho.")
             return
         _src = _st["chat_id"]
         _is_pub = _st.get("is_public", isinstance(_src, str))
@@ -7860,9 +7996,7 @@ async def message_dispatcher(client, message):
         if _start > _end:
             _start, _end = _end, _start
         total_files = _end - _start + 1
-        if total_files > BATCH_LIMIT:
-            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
-            return
+        # v108: range UNLIMITED — BATCH_LIMIT check hata diya gaya hai.
         _fr = _free_remaining(user_id)
         if _fr is not None and total_files > _fr:
             await message.reply_text(
@@ -7910,9 +8044,7 @@ async def message_dispatcher(client, message):
             start_id, end_id = end_id, start_id
 
         total = end_id - start_id + 1
-        if total > BATCH_LIMIT:
-            await message.reply_text(f"⚠️ Max {BATCH_LIMIT} posts allow hain.")
-            return
+        # v108: range UNLIMITED — BATCH_LIMIT check hata diya gaya hai.
         _fr = _free_remaining(user_id)
         if _fr is not None and total > _fr:
             await message.reply_text(
@@ -8121,6 +8253,9 @@ async def main():
     print("👉 V105: SPEED — auto-dest par 10s gap nahi (sirf personal chat par), clone/fbatch gap 2s -> 1s; Koyeb ~5 MB/s cap waisa hi", flush=True)
     print("👉 V106: /buy DIRECT — owner chat link, message pre-filled (bold)", flush=True)
     print("👉 V107: BROADCAST stylish — restart message fancy + version + highlights", flush=True)
+    print("👉 V108: RANGE UNLIMITED (5000 cap hata) + dusri link se end ID + topic link start fix", flush=True)
+    print("👉 V109: DEST PROGRESS — auto channel/group me bhi uploading + speed + File X/Y card", flush=True)
+    print("👉 V110: PROGRESS CARD ARROW design (sab bold, ▶/▷ bar)", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
