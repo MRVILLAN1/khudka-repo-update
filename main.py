@@ -275,7 +275,24 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # chaudaai body ki sabse lambi line se banti hai, isliye type karte waqt
 # box hilta nahi. Sab kuch BOLD (har line _fancy() se). Numbers sab asli
 # hain — sirf look badla hai.
-VERSION = "v113"
+# v114 (2026-11-18, on v113): CARD FIXES (user ke live card par).
+# (1) Cover lines 2 chhoti: end ➤ arrow text se aage nikal jata tha
+# (═ * (_w+2) ki wajah se), ab ═ * _w — arrow text ke right edge par.
+# (2) "Kitna nikla / kitna bacha" ab saaf dikhega: per-file card ki File
+# line me ⏳ remaining jud gaya (File X/Y • ✅ ok • ⏳ bacha • ❌ fail),
+# aur DM wale pinned batch status me "⏳ Bacha: N" ki line jud gayi.
+# v115 (2026-11-18, on v114): SMOOTH ANIMATION FIX.
+# Blink/typewriter smooth nahi tha — wajah: (1) frame time-based tha
+# (int(time.time()) % 6), par card edit sirf har 5s hota tha
+# (PROGRESS_EVERY=5), to frame ulta chalta tha (V -> VILLAN -> VILLA...
+# kyunki 5s ka gap mod 6 me -1 hota hai) aur blink bhi atak-atak ke
+# badalta tha. (2) Ab frame har ASLI edit par ek kadam aage badhta hai
+# (_ANIM_TICK counter) — V -> VI -> VIL -> ... hamesha seedha, koi skip
+# ya ulta nahi; dots har 2 edit par flip (2s ●, 2s ○ — shant blink).
+# (3) PROGRESS_EVERY 5 -> 1s, taaki card har second update ho aur
+# animation dikhe (edit FloodWait aaye to safe_edit use skip kar deta
+# hai, koi crash nahi). DM + dest dono ko ek hi call me wahi frame.
+VERSION = "v115"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -307,8 +324,14 @@ PORT = int(os.environ.get("PORT", 8000))
 
 # (Sequential mode me istemal nahi hota; rakha hai taaki purana env var tootey nahi)
 PARALLEL_TASKS = max(1, int(os.environ.get("PARALLEL_TASKS", "3")))
-# Progress card kitne second me update ho
-PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "5"))
+# Progress card kitne second me update ho (v115: 5 -> 1 — animation smooth
+# chahiye to card har second update hona chahiye; edit FloodWait aaye to
+# safe_edit use chupchaap skip kar deta hai, isliye koi crash nahi hoga).
+PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "1"))
+# v115: animation tick — har ASLI progress edit par +1. Frame isi se
+# chalta hai (time se nahi), isliye typewriter/blink hamesha aage badhta
+# hai, kabhi skip ya ulta nahi.
+_ANIM_TICK = [0]
 # /login command sirf is Telegram user ID ke liye (0 = sab ke liye khula).
 # Apni ID @userinfobot se le sakte ho. Bot public hai to set karna behtar hai.
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
@@ -845,6 +868,7 @@ async def _update_batch_status(status_msg, stats, force=False):
         f"📊 Progress: `{done}/{total}`\n"
         f"{bar} `{pct:.0f}%`\n"
         f"✅ Transferred: `{ok}` | ❌ Failed: `{fail}`\n"
+        f"⏳ Bacha: `{remaining}`\n"
         f"⏱️ Time Remaining: `{('~' + eta_str) if eta_str != '—' else '—'}`\n"
         "⏹ Cancel: `/cancel`"
     )
@@ -894,6 +918,9 @@ async def progress_bar(
     if (now - last_update[0]) < PROGRESS_EVERY and current != total:
         return
     last_update[0] = now
+    # v115 SMOOTH: har asli edit par tick +1 — frame hamesha agla aayega.
+    _ANIM_TICK[0] += 1
+    _tick = _ANIM_TICK[0]
 
     elapsed_time = max(now - start_time, 0.001)
     speed = current / elapsed_time
@@ -927,24 +954,29 @@ async def progress_bar(
     ]
     if stats is not None and getattr(stats, "total", 0):
         _cur = min(stats.done + 1, stats.total)
+        # v114: bacha hua bhi dikhao — kitna nikla (✅ ok) / kitna bacha (⏳).
+        _left = max(stats.total - stats.done, 0)
         _body.append(_fancy(
-            f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ❌ {stats.fail}"))
-    # Animation frame: har second agla frame (time-based) — har edit par
-    # card badalta hai, isliye text "move" karta hai.
+            f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ⏳ {_left} • ❌ {stats.fail}"))
+    # Animation frame: tick-based — har edit par ek kadam aage (typewriter
+    # ek akshar, dots har 2 edit par flip). DM + dest dono ko ek hi call
+    # me wahi frame milta hai.
     _type_frames = ["V▌", "VI▌", "VIL▌", "VILL▌", "VILLA▌", "VILLAN"]
-    _fi = int(time.time()) % len(_type_frames)
+    _fi = _tick % len(_type_frames)
     _header = _fancy(f"SRC BOT BY MR {_type_frames[_fi]}")
-    # Footer black dots blink: ek second ●, agle second ○.
-    _dots_on = (int(time.time()) % 2 == 0)
+    # Footer black dots blink: 2 edit ●, 2 edit ○ (shant blink).
+    _dots_on = ((_tick // 2) % 2 == 0)
     _footer = _fancy("● ○ ○ VILLAN ○ ○ ●" if _dots_on
                      else "○ ○ ○ VILLAN ○ ○ ○")
     # Box ki chaudaai body ki sabse lambi line se — type karte waqt box
     # hilta nahi. Right side khula hai (koi right border nahi); cover
     # lines (top/divider/bottom) ke right end par ➤ arrow hai.
     _w = max(len(x) for x in [_header] + _body + [_footer])
-    _top = "╔" + "═" * (_w + 2) + "➤"
-    _div = "╠" + "═" * (_w + 2) + "➤"
-    _bot = "╚" + "═" * (_w + 2) + "➤"
+    # v114: cover lines 2 chhoti (═ * _w) — end ➤ arrow text se aage
+    # nikal jata tha, ab text ke right edge par aayega.
+    _top = "╔" + "═" * _w + "➤"
+    _div = "╠" + "═" * _w + "➤"
+    _bot = "╚" + "═" * _w + "➤"
     lines = [_top, "║ " + _header.center(_w), _div]
     lines += ["║ " + x for x in _body]
     lines += [_div, "║ " + _footer.center(_w), _bot]
@@ -6148,6 +6180,8 @@ async def help_handler(client, message):
         "• v111 — Restart fix: auto-dest group/channel ab backup se wapas aayega, restart par dusra group nahi banega.\n"
         "• v112 — Dest rule: /settings me chat ID set ho to batch wahi jayega (auto-dest nahi chalega); na ho to group -> auto group, channel -> auto channel.\n"
         "• v113 — Progress card animated: SRC BOT BY MR VILLAN typewriter, blinking dots, right-end ➤ arrows (right side open).\n"
+        "• v114 — Card fix: cover lines 2 chhoti (end ➤ ab text ke edge par), File line + status me ⏳ Bacha dikhega.\n"
+        "• v115 — Smooth animation: typewriter/blink ab har edit par ek kadam aage (pehle ulta chalta tha), card har 1s update.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -8390,6 +8424,8 @@ async def main():
     print("👉 V111: AUTO-DEST RESTORE FIX — restart par purana group/channel reuse hoga", flush=True)
     print("👉 V112: DEST RULE — settings chat ID set ho to batch wahi, warna auto group/channel", flush=True)
     print("👉 V113: ANIMATED PROGRESS CARD — typewriter VILLAN + blinking dots + right ➤", flush=True)
+    print("👉 V114: CARD FIX — cover lines chhoti, File line + status me Bacha count", flush=True)
+    print("👉 V115: SMOOTH ANIMATION — typewriter/blink har edit par ek kadam, card 1s update", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
