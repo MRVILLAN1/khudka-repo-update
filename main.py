@@ -330,7 +330,21 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # (bahar -> andar -> bahar, koi jump nahi), dono side mirror me.
 # Divider + footer wapas aaye (bottom border nahi) — card 11 lines.
 # Typewriter header + smooth animation + speed fix (v118) waise hi hain.
-VERSION = "v119"
+# v120 (2026-11-18, on v119): USER KA PASTED CARD — user ne kaha phirse
+# blunder ho gaya, maine thik kar diya, isko hi dekhlo (poora 14-line
+# card paste kiya). Wapas aaya: header ke neeche divider, UPLOADING ke
+# neeche blank line, footer ke baad bottom border. Border 24 ═ (user ke
+# paste jaisi — 26 chars, phone par kabhi wrap nahi hogi). Footer dots
+# 5-5 dono side + ping-pong blink (v119) waise hi. Typewriter header,
+# smooth animation, speed fix (v118), DM card (v116) waise hi hain.
+# v121 (2026-11-18, on v120): SPINNER HEADER — user ne kaha typing
+# wala VILLAN animation change karke kuch aur kar do, apne hisab se.
+# Typewriter (V -> VI -> ... -> VILLAN) hata diya; ab header me VILLAN
+# ke pehle ek ghumta hua spinner hai (◐ -> ◑ -> ◒ -> ◓, har edit par
+# ek kadam). Header ki lambai har frame me same rehti hai (spinner sirf
+# glyph badalta hai), isliye card hilta nahi. Footer dots (5-5, ping-pong),
+# 14-line card, border 24, speed fix (v118), DM card (v116) waise hi.
+VERSION = "v121"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -983,11 +997,11 @@ async def progress_bar(
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
 
-    # v113/v117/v119: ANIMATED FRAME — Typewriter header + footer dots
-    # (divider/footer v117 me hataye the, footer v119 me wapas — 5 dots
-    # har side, bari bari blink). Har line _fancy() se guzarti hai,
-    # isliye saare akshar + number bold dikhte hain. Numbers sab asli
-    # hain (bytes/speed/ETA/counts).
+    # v113/v121: ANIMATED FRAME — Spinner header + footer dots (5 dots har
+    # side, bari bari ping-pong blink). Poora 14-line card (user ke paste
+    # jaisa). Har line _fancy() se guzarti hai, isliye saare akshar +
+    # number bold dikhte hain. Numbers sab asli hain (bytes/speed/ETA/
+    # counts).
     filled = int(percentage // 10)
     _bar = "▶" * filled + "▷" * (10 - filled)
 
@@ -1003,6 +1017,7 @@ async def progress_bar(
 
     _body = [
         _fancy(f"➤ {op} ➤ {percentage:.0f}%"),
+        "",
         _bar,
         _fancy(f"➤ Size: {humanbytes(current)} / {humanbytes(total)}"),
         _fancy(f"➤ Speed: {humanbytes(speed)}/s"),
@@ -1015,11 +1030,12 @@ async def progress_bar(
         _left = max(stats.total - stats.done, 0)
         _body.append(_fancy(
             f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ⏳ {_left} • ❌ {stats.fail}"))
-    # Animation frame: tick-based — har edit par ek kadam aage (typewriter
-    # ek akshar). DM + dest dono ko ek hi call me wahi frame milta hai.
-    _type_frames = ["V▌", "VI▌", "VIL▌", "VILL▌", "VILLA▌", "VILLAN"]
-    _fi = _tick % len(_type_frames)
-    _header = _fancy(f"SRC BOT BY MR {_type_frames[_fi]}")
+    # Animation frame: tick-based — har edit par spinner ek kadam aage
+    # (◐ -> ◑ -> ◒ -> ◓). DM + dest dono ko ek hi call me wahi frame
+    # milta hai.
+    _spin_frames = ["◐", "◑", "◒", "◓"]
+    _si = _tick % len(_spin_frames)
+    _header = _fancy(f"SRC BOT BY MR {_spin_frames[_si]} VILLAN")
     # v119: footer wapas — har side 5 dots (3 ki jagah), ● ek-ek karke
     # (bari bari) aage-peeche chalta hai (ping-pong: bahar -> andar ->
     # bahar, koi jump nahi). Dono side mirror me chalte hain.
@@ -1028,17 +1044,18 @@ async def progress_bar(
     _ld = ["●" if i == _p else "○" for i in range(5)]
     _rd = ["●" if i == (4 - _p) else "○" for i in range(5)]
     _footer = _fancy(f"{' '.join(_ld)} VILLAN {' '.join(_rd)}")
-    # v117: card chhota rakha tha (divider/footer/bottom hataye the);
-    # v119 me sirf divider + footer wapas aaye (bottom border nahi).
-    # Right side aur neeche khula hai; border max 30 ═ (phone par wrap
-    # nahi hoga).
+    # v120: user ka pasted card — poora 14-line card wapas (header divider,
+    # blank line, footer divider, bottom border). Border 24 ═ (user ke
+    # paste jaisi — 26 chars, phone par kabhi wrap nahi hogi). Footer 5
+    # dots + ping-pong blink (v119) waise hi.
     _w = max(len(x) for x in [_header] + _body + [_footer])
-    _bw = min(_w, 30)
+    _bw = min(_w, 24)
     _top = "╔" + "═" * _bw + "➤"
     _div = "╠" + "═" * _bw + "➤"
-    lines = [_top, "║ " + _header.center(_bw)]
+    _bot = "╚" + "═" * _bw + "➤"
+    lines = [_top, "║ " + _header.center(_bw), _div]
     lines += ["║ " + x for x in _body]
-    lines += [_div, "║ " + _footer.center(_bw)]
+    lines += [_div, "║ " + _footer.center(_bw), _bot]
     _text = "\n".join(lines)
     # v118 SPEED: beech wale edits background me — upload inka wait na kare.
     # Aakhri edit (100%) await karo, taaki wo "✅ Sent" se pehle pakka lage.
@@ -6284,6 +6301,8 @@ async def help_handler(client, message):
         "• v117 — Card chhota: 5 lines hata di (divider/footer/bottom) — sirf top border + header + progress lines.\n"
         "• v118 — Speed fix: card edits ab background me (upload kabhi edit ka wait nahi karega), speed wapas ~4-5 MB/s.\n"
         "• v119 — Footer wapas: har side 5 dots, ● bari bari aage-peeche chalta hai (ping-pong blink).\n"
+        "• v120 — Poora card wapas (14 lines, user ke paste jaisa): border 24, footer 5 dots + blink waise hi.\n"
+        "• v121 — Header naya: typewriter ki jagah ghumta spinner (◐◑◒◓) VILLAN ke pehle.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -8532,6 +8551,8 @@ async def main():
     print("👉 V117: CARD CHHOTA — 5 lines hata di, sirf top border + header + progress", flush=True)
     print("👉 V118: SPEED FIX — card edits background me, upload kabhi wait nahi karega", flush=True)
     print("👉 V119: FOOTER WAPAS — 5 dots har side, ● bari bari ping-pong blink", flush=True)
+    print("👉 V120: USER PASTED CARD — poora 14-line card, border 24, footer 5 dots + blink", flush=True)
+    print("👉 V121: SPINNER HEADER — typewriter ki jagah ◐◑◒◓ ghumta hai VILLAN ke pehle", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
