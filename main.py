@@ -172,7 +172,46 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # extract mode se chale. CLONE mode waisa hi (har baar naya group).
 # (6) Stylish: mode-choice header + dest labels + clone/extract done
 # fancy text me.
-VERSION = "v103"
+# v104 (2026-11-18, on v103): LIVE BUGFIX — do crash, dono v103 me:
+# (1) /help MESSAGE_TOO_LONG — help_text 4096-char Telegram limit se
+# bada ho gaya tha (har version ki NEW UPDATES lines judti gayi), to
+# /help har baar fail hota tha. Ab help_handler _send_long_text se
+# tukdo me bhejta hai (4000-char chunk, line boundary par).
+# (2) NameError: PUBLIC_STATES is not defined — v101 me /public hatate
+# waqt uska dict bhi hat gaya tha, par 11 jagah .pop()/in use baki tha:
+# mode buttons (Public/Private) + /batch + dispatcher sab crash karte
+# the. Dict wapas joda (stub flow dead hai, sirf cleanup ke liye).
+# v105 (2026-11-18, on v104): AUDIT + SPEED.
+# AUDIT (sab add kia hua check kiya — v94-v104): symtable scan se koi
+# undefined name nahi mila (PUBLIC_STATES wala bug v104 me theek hai);
+# 27 feature checks pass (pin-copy, /pin, unified batch, /ai hata, auto
+# dest channel+group, /setchannel, mode screen, reset, chunked help).
+# SPEED (Koyeb Eco ~5 MB/s cap waisa hi — code usse upar nahi ja sakta):
+# (1) run_batch pacing DEST par based: 10s PRIVATE_GAP ab sirf tab jab
+# dest APNA PERSONAL CHAT ho (DM me bulk bhejne par FloodWait lagta hai).
+# Dest channel/group ho (auto-dest ya settings chat_id) to wahan normal
+# FAST/SLOW gap (2-3s) — private batch auto-dest par ~3x tez.
+# Personal-chat delivery bilkul waisi hi (10s gap, koi risk nahi).
+# (2) run_clone + run_fbatch: har media file ke baad ka gap 2s -> 1s
+# (userbot sends, FloodWait retry pehle se hai — backstop waisa hi).
+# NAHI BADLA (jaan-boojh kar): MULTI_PARTS=3 (v93 safe level; env se 6
+# tak badha sakte ho), FAST/SLOW_GAP defaults, transfer path (v88 me
+# user ne download+upload maanga tha, instant copy band hai).
+# v106 (2026-11-18, on v105): /buy DIRECT.
+# /buy dabte hi "Owner se Baat Karo" button dikhega — dabate hi owner
+# ka chat khul jayega, aur message pehle se likha hoga (fancy BOLD):
+# "Hello brother, I want to buy premium SRC bot" — bas send dabana hai.
+# /start menu ka "Buy VIP Premium Plan" button bhi wahi karta hai.
+# (t.me/?text= link se text pre-filled aata hai — khud se kuch type
+# nahi karna padta; payment manual UPI hi rahega, plan payment ke
+# baad activate hoga.)
+# v107 (2026-11-18, on v106): RESTART BROADCAST STYLISH.
+# Deploy/restart par sab users ko jaane wala chhota message ab fancy
+# + sundar hai (heading + "Kya naya hai" fancy bold me, version bhi
+# likha hoga). Chhota hi hai (v77 rule — lamba changelog nahi jayega).
+# Bullets me latest highlights hain — agle version me yahi line update
+# karni hai.
+VERSION = "v107"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -387,6 +426,7 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
 
 USER_STATES = {}
 SETCHANNEL_STATES = {}  # v102: uid -> {"step": "WAITING_ID"}
+PUBLIC_STATES = {}  # v104: /public hata diya gaya (v101) — sirf state cleanup ke liye bacha hai
 ACTIVE_BATCHES = {}  # user_id -> asyncio.Event (cancel flag)
 LOGIN_STATES = {}  # user_id -> {"step", "phone", "phone_code_hash", "tmp"}
 USER_CLIENTS = {}  # user_id -> running pyrogram Client (per-user userbot)
@@ -3020,12 +3060,16 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                 # v50 PACING: PRIVATE batch me 10s countdown gap, PUBLIC par nahi.
                 # Countdown per-file progress message par dikhta hai (10..1).
                 # Pinned status ko har second edit nahi karte (edit-flood se bachne).
+                # v105 SPEED: 10s gap sirf tab jab dest APNA PERSONAL CHAT ho (DM
+                # me bulk bhejne par FloodWait lagta hai). Dest channel/group ho
+                # (auto-dest ya settings chat_id) to DM wala risk nahi — wahan
+                # normal FAST/SLOW gap hi kaafi hai, batch tez chalega.
                 if mid != ids[-1]:
                     if not is_public and not public_fast:
                         _kind = info.get("kind") if isinstance(info, dict) else None
                         if _kind == "text":
                             await asyncio.sleep(FAST_GAP)
-                        else:
+                        elif dest_chat == owner_id:
                             print(f"[WAIT] Private gap {int(PRIVATE_GAP)}s before next file", flush=True)
                             _left = int(PRIVATE_GAP)
                             while _left > 0:
@@ -3035,6 +3079,11 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                                     await safe_edit(prog_msg, f"⏳ Next file in {_left}s")
                                 await asyncio.sleep(1)
                                 _left -= 1
+                        else:
+                            gap = FAST_GAP if (
+                                isinstance(info, dict) and info.get("delivered_fast")
+                            ) else SLOW_GAP
+                            await asyncio.sleep(gap)
                     else:
                         gap = FAST_GAP if (
                             isinstance(info, dict) and info.get("delivered_fast")
@@ -4741,7 +4790,8 @@ async def run_fbatch(client, uid, src_chat, dest_chat, status_msg):
                             await safe_edit(prog_msg, f"❌ Upload fail • ID `{m.id}`")
                         except Exception:
                             pass
-                await asyncio.sleep(2)
+                # v105 SPEED: gap 2s -> 1s (userbot sends, FloodWait retry backstop hai)
+                await asyncio.sleep(1)
             folder_report.append(f"• {tname}: ✅ {f_copied} | ❌ {f_failed}")
             if cancel_event.is_set():
                 break
@@ -4963,8 +5013,8 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                             _pinned_n += 1
                 else:
                     failed += 1
-                # Flood se bachne ke liye har media file ke baad chhota gap
-                await asyncio.sleep(2)
+                # v105 SPEED: gap 2s -> 1s (FloodWait retry pehle se hai — backstop waisa hi)
+                await asyncio.sleep(1)
             if cancel_event.is_set():
                 break
         # Invite link (private group kholne ke liye)
@@ -5405,13 +5455,16 @@ async def _handle_home_callbacks(client, query, uid, data):
             pass
         return
     if data == "home_buy_vip":
-        # v97: Buy VIP = buy_handler wala text (owner se UPI contact).
+        # v106: Buy VIP = seedha owner ke chat me (message pre-filled).
         await _edit_panel(query,
-            "**VILLAN Premium**\n\n"
-            f"Contact the owner: `{OWNER_USERNAME}`\n"
-            "Message: `Hi, I want premium`\n"
-            "Your plan activates after payment.",
-            _page_kb())
+            "👑 **VILLAN Premium**\n\n"
+            "Neeche wale button se seedha owner ke chat me jao —\n"
+            "message pehle se likha hoga, bas send dabana hai.\n\n"
+            "Payment manual UPI se hoti hai; plan payment ke baad activate hoga.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Owner se Baat Karo", url=_buy_owner_url())],
+                [InlineKeyboardButton("⬅️ Back", callback_data="home_start")],
+            ]))
         return
     if data == "home_any_help":
         # v97: Any Help = owner se contact.
@@ -5864,6 +5917,26 @@ async def plan_handler(client, message):
     await message.reply_text(f"{card}\n\n🔑 {login}")
 
 
+async def _send_long_text(message, text, parse_mode=None, limit=4000):
+    """v104: lamba text (jaise /help) Telegram ki 4096-char limit me
+    tukdo me bhejo — line boundary par todo, taaki Markdown na toote."""
+    if len(text) <= limit:
+        await message.reply_text(text, parse_mode=parse_mode)
+        return
+    _chunks = []
+    _cur = ""
+    for _line in text.split("\n"):
+        if _cur and len(_cur) + len(_line) + 1 > limit:
+            _chunks.append(_cur)
+            _cur = _line
+        else:
+            _cur = _cur + "\n" + _line if _cur else _line
+    if _cur:
+        _chunks.append(_cur)
+    for _c in _chunks:
+        await message.reply_text(_c, parse_mode=parse_mode)
+
+
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client, message):
     """Bot kaise use karein — poori guide."""
@@ -5881,6 +5954,10 @@ async def help_handler(client, message):
         "• v101 — /public, /clone, /sendallrange HATA DIYE (sirf /batch + /sendall); channel se batch niklega to apna alag channel banega (ek ID = ek channel), bot auto-admin, pin-copy.\n"
         "• v102 — SRC jaisa interface: /start me naam + FREE (X/10 Used) + Target + RAM Buffer; Start Forwarding Now se Public/Private mode chuno; /setchannel se destination set karo; Full Account Reset (confirm ke saath).\n"
         "• v103 — Auto-dest har source ke liye: channel -> apna channel, group -> apna group (folderwise); ek ID = ek channel + ek group, bot auto-admin; /batch link-first prompt; stylish fancy headings.\n"
+        "• v104 — Bugfix: /help ab tukdo me aayega (lamba hone par bhi chalega); Public/Private mode buttons aur /batch ka crash theek hua.\n"
+        "• v105 — Speed: auto-dest channel/group par private batch ka 10s gap hata (personal chat par waisa hi); clone/fbatch gap 2s -> 1s.\n"
+        "• v106 — /buy direct: button dabate hi owner ka chat khulega, message pehle se likha hoga (bold me).\n"
+        "• v107 — Restart message stylish: update ka message ab fancy + sundar aayega.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -5900,7 +5977,7 @@ async def help_handler(client, message):
         "8. /fbatch — Folderwise batch (folderwise kaam ke liye ek hi command hai): pehle SOURCE group/channel ka link bhejo, phir DEST group ka link bhejo. Bot naam padh ke topic samjhega, dest me us naam ka folder banayega, aur us naam wali saari cheezein (pdf / text / video / pic) us folder me sequencewise COPY karega. Delete kuch nahi hoga, source waisa ka waisa rahega. Har file par download + upload progress dikhega, jaise /batch me dikhta hai. Dest me sirf bot admin ho to bhi chalega, par duplicate folder se bachne ke liye dest me login account ko sirf member bana do. Dest group me Topics ON hona chahiye.\n"
         "9. /setchannel — Destination set karo: /setchannel likho, channel/group ID bhejo (jaise -100...), ya \"Save to My Private Chat\" button dabao. Wahi destination /settings wale chat_id me save hota hai.\n"
         "10. /settings — Rename, caption template, word remove/replace, thumbnail, watermark, upload method badlo.\n"
-        "11. /plan — Apna plan dekho. /buy — Premium kharido (payment manual UPI hai).\n"
+        "11. /plan — Apna plan dekho. /buy — Premium kharido: button dabate hi owner ka chat khul jayega, message pehle se likha hoga (bas send dabao). Payment manual UPI hai.\n"
         "12. /cancel — Chal raha kaam roko (batch, clone, create, fbatch — koi bhi). Batch rokne ke baad resume karne ke liye button ya /resume use karo.\n"
         "\n"
         "Seedha link bhejne par ek file ki copy hogi. Folderwise kaam /batch (folder group) ya /fbatch se hoga.\n"
@@ -5908,18 +5985,31 @@ async def help_handler(client, message):
         f"Owner: `{OWNER_USERNAME}`"
     )
 
-    await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
+    await _send_long_text(message, help_text, parse_mode=enums.ParseMode.MARKDOWN)
+
+
+def _buy_owner_url():
+    """v106: owner ke chat ka link, buy wala message pehle se likha hua
+    (fancy BOLD — t.me ?text= me plain text hi jata hai, isliye Unicode
+    bold use kiya hai)."""
+    from urllib.parse import quote as _quote
+    _uname = (OWNER_USERNAME or "").lstrip("@")
+    _want = _fancy("Hello brother, I want to buy premium SRC bot")
+    return f"https://t.me/{_uname}?text={_quote(_want)}"
 
 
 @app.on_message(filters.command("buy") & filters.private)
 async def buy_handler(client, message):
-    """Premium kharidne ke liye owner ka username dikhao."""
+    """v106: /buy — seedha owner ke chat me le jao, message pre-filled."""
     await message.reply_text(
-        "**VILLAN Premium**\n\n"
-        f"Contact the owner: `{OWNER_USERNAME}`\n"
-        "Message: `Hi, I want premium`\n"
-        "Your plan activates after payment.",
+        "👑 **VILLAN Premium**\n\n"
+        "Neeche wale button se seedha owner ke chat me jao —\n"
+        "message pehle se likha hoga, bas send dabana hai.\n\n"
+        "Payment manual UPI se hoti hai; plan payment ke baad activate hoga.",
         parse_mode=enums.ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Owner se Baat Karo", url=_buy_owner_url())],
+        ]),
     )
 
 
@@ -7904,7 +7994,17 @@ async def _broadcast_update():
           flush=True)
     sent = failed = 0
     # v77: lamba changelog broadcast BAND — sirf ye chhota message jayega.
-    text = "<b>🔄 NEW UPDATE ADDED</b>\n\nBot update ho gaya hai."
+    # v107: wahi chhota message, par stylish — fancy heading + version +
+    # latest highlights (bullets har version me update karne hain).
+    text = (
+        f"🔥 {_fancy('VILLAN UPDATED')} 🔥\n\n"
+        f"✨ Bot update ho gaya hai — {VERSION} live hai!\n\n"
+        f"🆕 {_fancy('Kya naya hai:')}\n"
+        "• /batch — channel + group dono me auto-dest\n"
+        "• /buy — seedha owner se baat, message ready\n"
+        "• Speed — auto-dest par tez batch\n\n"
+        "👇 /start dabao aur try karo!"
+    )
     for uid in users:
         try:
             await app.send_message(uid, text, parse_mode=enums.ParseMode.HTML)
@@ -8017,6 +8117,10 @@ async def main():
     print("👉 V101: /public+/clone+/sendallrange HATA DIYE; channel batch -> apna alag channel (ek ID = ek channel), bot auto-admin, pin-copy", flush=True)
     print("👉 V102: SRC-style interface — /start status lines, Public/Private mode screen, /setchannel, Full Account Reset (confirm)", flush=True)
     print("👉 V103: AUTO-DEST sabke liye — channel->channel, group->group (folderwise); ek ID = ek channel + ek group, bot auto-admin", flush=True)
+    print("👉 V104: BUGFIX — /help chunked send (MESSAGE_TOO_LONG fix), PUBLIC_STATES dict wapas (mode buttons + /batch crash fix)", flush=True)
+    print("👉 V105: SPEED — auto-dest par 10s gap nahi (sirf personal chat par), clone/fbatch gap 2s -> 1s; Koyeb ~5 MB/s cap waisa hi", flush=True)
+    print("👉 V106: /buy DIRECT — owner chat link, message pre-filled (bold)", flush=True)
+    print("👉 V107: BROADCAST stylish — restart message fancy + version + highlights", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
