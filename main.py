@@ -292,7 +292,18 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # (3) PROGRESS_EVERY 5 -> 1s, taaki card har second update ho aur
 # animation dikhe (edit FloodWait aaye to safe_edit use skip kar deta
 # hai, koi crash nahi). DM + dest dono ko ek hi call me wahi frame.
-VERSION = "v115"
+# v116 (2026-11-18, on v115): SCREENSHOT FIXES (user ke live card par).
+# (1) Border wrap: cover lines (╔ + ═×W + ➤) phone par wrap ho jati
+# thin — File line lambi hone se W=35 ho gaya tha, border 37 chars ka
+# hokar wrap karta tha aur ➤ agle line par gir jata tha (sab idhar-udhar
+# dikhta tha). Ab border max 30 ═ (kabhi wrap nahi hoga); header/footer
+# bhi isi chaudaai par center honge.
+# (2) DM stats: group source (run_clone) me per-file Arrow card sirf
+# DEST topic me banta tha — DM me sirf plain status text tha, isliye bot
+# chat me File/speed/⏳ bacha nahi dikhta tha. Ab run_clone me bhi DM ka
+# per-file card (_dmprog) banta hai — download + upload dono ki progress
+# DM + dest dono jagah wahi card dikhayegi (progress_bar ka dest_msg).
+VERSION = "v116"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -972,14 +983,16 @@ async def progress_bar(
     # hilta nahi. Right side khula hai (koi right border nahi); cover
     # lines (top/divider/bottom) ke right end par ➤ arrow hai.
     _w = max(len(x) for x in [_header] + _body + [_footer])
-    # v114: cover lines 2 chhoti (═ * _w) — end ➤ arrow text se aage
-    # nikal jata tha, ab text ke right edge par aayega.
-    _top = "╔" + "═" * _w + "➤"
-    _div = "╠" + "═" * _w + "➤"
-    _bot = "╚" + "═" * _w + "➤"
-    lines = [_top, "║ " + _header.center(_w), _div]
+    # v116: border max 30 ═ — lambi line phone par wrap ho jati thi aur ➤
+    # agle line par gir jata tha. Header/footer bhi isi chaudaai par
+    # center honge, taaki border se align rahen.
+    _bw = min(_w, 30)
+    _top = "╔" + "═" * _bw + "➤"
+    _div = "╠" + "═" * _bw + "➤"
+    _bot = "╚" + "═" * _bw + "➤"
+    lines = [_top, "║ " + _header.center(_bw), _div]
     lines += ["║ " + x for x in _body]
-    lines += [_div, "║ " + _footer.center(_w), _bot]
+    lines += [_div, "║ " + _footer.center(_bw), _bot]
     _text = "\n".join(lines)
     await safe_edit(message, _text)
     if dest_msg is not None:
@@ -1180,7 +1193,7 @@ def _info_from_msg(target_msg, msg_id):
     return info
 
 
-async def download_file_classic(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
+async def download_file_classic(user_client, info, prog_msg, stats=None, uid=None, bot_client=None, dm_prog=None):
     """Slow path: file ko disk par download karo (settings ya file_id fail par).
     prog_msg = alag progress message (pinned status_msg se alag)."""
     target_msg = info.get("target_msg")
@@ -1198,6 +1211,12 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
             await safe_edit(prog_msg, f"📥 Downloading • ID `{msg_id}` • {humanbytes(info.get('file_size', 0))}")
         except Exception:
             pass
+    # v116: DM card bhi wahi dikhaye (run_clone DM stats).
+    if dm_prog is not None:
+        try:
+            await safe_edit(dm_prog, f"📥 Downloading • ID `{msg_id}` • {humanbytes(info.get('file_size', 0))}")
+        except Exception:
+            pass
     try:
         dl_path = os.path.join(tmpdir, info["file_name"])
         last_update = [time.time()]
@@ -1208,7 +1227,7 @@ async def download_file_classic(user_client, info, prog_msg, stats=None, uid=Non
             progress=progress_bar,
             progress_args=(
                 prog_msg, start_time, last_update,
-                f"📥 Downloading • ID `{msg_id}`", stats, uid, bot_client,
+                f"📥 Downloading • ID `{msg_id}`", stats, uid, bot_client, dm_prog,
             ),
         )
         if not file_path or not os.path.exists(file_path):
@@ -1361,7 +1380,7 @@ async def _get_media_session(user_client, dc_id):
     return session
 
 
-async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
+async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client, dm_prog=None):
     """Ek file ke parts concurrent fetch karo. Success par dl_path,
     kisi bhi failure par exception (caller classic fallback lega)."""
     from pyrogram import raw as _raw
@@ -1449,7 +1468,7 @@ async def _download_multi(user_client, info, prog_msg, stats, uid, bot_client):
                         await progress_bar(
                             min(downloaded[0], file_size), file_size,
                             prog_msg, start_time, last_update, label,
-                            stats, uid, bot_client)
+                            stats, uid, bot_client, dm_prog)
                     except Exception:
                         pass
         finally:
@@ -1524,7 +1543,7 @@ def _flood_seconds(err_text):
     return 60
 
 
-async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
+async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None, dm_prog=None):
     """v41 wrapper: pehle multi-connection download try karo, fail par classic.
     v52: FloodWait par file ko turant fail mat karo — poora wait karke
     ek baar dobara try karo. 2026-10-28 logs me 121s ExportAuthorization
@@ -1551,7 +1570,7 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
                 and (info.get("file_size", 0) or 0) >= MULTI_MIN_SIZE):
             try:
                 dl_path = await _download_multi(
-                    user_client, info, prog_msg, stats, uid, bot_client)
+                    user_client, info, prog_msg, stats, uid, bot_client, dm_prog)
                 # classic jaisa tail: photo extension fix + video thumb
                 if info.get("kind") == "photo" and not dl_path.lower().endswith(
                         (".jpg", ".jpeg", ".png", ".webp")):
@@ -1577,7 +1596,7 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
                 print(f"Multi download fail ({msg_id}), classic par ja raha: {e}",
                       flush=True)
         return await download_file_classic(
-            user_client, info, prog_msg, stats, uid, bot_client)
+            user_client, info, prog_msg, stats, uid, bot_client, dm_prog)
 
     # v53 PROACTIVE REFRESH: chunk me fetch hua reference purana ho to
     # pehle hi fresh kar lo. Refetch fail ho to purane reference se hi
@@ -1823,7 +1842,7 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
 # forum topic me bhejne ke liye raw messages.SendMedia use karna padta hai.
 async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                              file_path=None, caption="", info=None, thumb=None, prog_msg=None,
-                             stats=None):
+                             stats=None, dm_prog=None):
     """Topic me media bhejo (raw API, top_msg_id se).
     file_id diya to server-side instant, file_path diya to upload karke.
     Returns True/False."""
@@ -1856,7 +1875,7 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                     file_path, progress=progress_bar,
                     progress_args=(
                         prog_msg, _up_start, _up_last,
-                        f"🚀 Uploading • ID `{info.get('msg_id')}`", stats))
+                        f"🚀 Uploading • ID `{info.get('msg_id')}`", stats, None, None, dm_prog))
             else:
                 uploaded = await client.save_file(file_path)
             mime, _ = mimetypes.guess_type(file_path)
@@ -5136,6 +5155,7 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
         # v109: dest topic card ke counts ke liye BatchStats.
         _cstats = BatchStats(total_msgs)
         _dprog = None  # v109: dest topic ka per-file progress card
+        _dmprog = None  # v116: DM ka per-file progress card (wahi stats)
         for key in ordered:
             msgs = buckets.get(key, [])
             if not msgs:
@@ -5187,18 +5207,38 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     except Exception:
                         pass
                 _dprog = None
+                # v116: DM me bhi wahi card — bot chat me stats dikhenge
+                # (pehle sirf dest topic me card tha, DM me sirf plain
+                # status text tha). DM card ka lifecycle _dprog jaisa hi.
+                if _dmprog is not None:
+                    try:
+                        await _dmprog.delete()
+                    except Exception:
+                        pass
+                _dmprog = None
+                try:
+                    _dmprog = await client.send_message(
+                        uid, "⏳ Preparing…",
+                        parse_mode=enums.ParseMode.MARKDOWN)
+                except Exception:
+                    _dmprog = None
                 try:
                     _dprog = await userbot.send_message(
                         dest_id, "⏳ Preparing…",
                         reply_to_message_id=dest_tid)
                 except Exception:
                     _dprog = None
-                fp = await download_file(userbot, info, _dprog, _cstats, uid, client)
+                fp = await download_file(userbot, info, _dprog, _cstats, uid, client, _dmprog)
                 if not fp:
                     failed += 1
                     if _dprog is not None:
                         try:
                             await safe_edit(_dprog, f"❌ Download fail • ID `{m.id}`")
+                        except Exception:
+                            pass
+                    if _dmprog is not None:
+                        try:
+                            await safe_edit(_dmprog, f"❌ Download fail • ID `{m.id}`")
                         except Exception:
                             pass
                     if info.get("tmpdir"):
@@ -5212,7 +5252,7 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                 ok = await _raw_send_to_topic(
                     userbot, dest_peer, dest_tid, info["kind"], file_path=fp,
                     caption=info.get("caption") or "", info=info,
-                    prog_msg=_dprog, stats=_cstats)
+                    prog_msg=_dprog, stats=_cstats, dm_prog=_dmprog)
                 if info.get("tmpdir"):
                     shutil.rmtree(info["tmpdir"], ignore_errors=True)
                 if ok:
@@ -5227,6 +5267,11 @@ async def run_clone(client, uid, src_chat, status_msg, only_topic=None, range_st
                     if _dprog is not None:
                         try:
                             await safe_edit(_dprog, f"❌ Upload fail • ID `{m.id}`")
+                        except Exception:
+                            pass
+                    if _dmprog is not None:
+                        try:
+                            await safe_edit(_dmprog, f"❌ Upload fail • ID `{m.id}`")
                         except Exception:
                             pass
                 # v105 SPEED: gap 2s -> 1s (FloodWait retry pehle se hai — backstop waisa hi)
@@ -6182,6 +6227,7 @@ async def help_handler(client, message):
         "• v113 — Progress card animated: SRC BOT BY MR VILLAN typewriter, blinking dots, right-end ➤ arrows (right side open).\n"
         "• v114 — Card fix: cover lines 2 chhoti (end ➤ ab text ke edge par), File line + status me ⏳ Bacha dikhega.\n"
         "• v115 — Smooth animation: typewriter/blink ab har edit par ek kadam aage (pehle ulta chalta tha), card har 1s update.\n"
+        "• v116 — Card fix: border max 30 (phone par wrap nahi hoga), clone batch me DM me bhi wahi progress card + stats.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -8426,6 +8472,7 @@ async def main():
     print("👉 V113: ANIMATED PROGRESS CARD — typewriter VILLAN + blinking dots + right ➤", flush=True)
     print("👉 V114: CARD FIX — cover lines chhoti, File line + status me Bacha count", flush=True)
     print("👉 V115: SMOOTH ANIMATION — typewriter/blink har edit par ek kadam, card 1s update", flush=True)
+    print("👉 V116: CARD FIX — border max 30 (no wrap), clone DM me bhi progress card", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
