@@ -241,7 +241,41 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # wahi design dikhayega, DM + dest dono me. Sab kuch BOLD hai (har line
 # _fancy() se guzarti hai). Bar: ▶ filled, ▷ khaali (10 blocks).
 # Numbers sab asli hain (bytes/speed/ETA/counts) — sirf look badla hai.
-VERSION = "v110"
+# v111 (2026-11-18, on v110): AUTO-DEST RESTORE FIX.
+# BUG: restart par dusra group ban jata tha. Root cause — auto_dest.json
+# BACKUP to hota tha (_BACKUP_KNOWN me tha, har save par backup channel
+# me copy jati thi), par RESTORE ki list (stores) me tha hi nahi! Koyeb
+# Eco par redeploy par local files mit jati hain, to mapping gayab ho
+# jati thi aur agle batch par naya group ban jata tha (channel ka bhi
+# wahi haal tha). Ab restore list me hai — restart ke baad wahi purana
+# group/channel reuse hoga, naya nahi banega.
+# (2) Group validation me ek retry: get_chat pehli baar transient
+# wajah se fail ho to 3s ruk ke dobara try karo — tab bhi fail ho to hi
+# mapping hatao aur naya banao. Isse startup ki chhoti gadbad par bhi
+# duplicate group nahi banega.
+# v112 (2026-11-18, on v111): DEST RULE (user).
+# /settings me chat_id set ho to /batch WAHI jayega — auto-dest bilkul
+# nahi chalega. Chat_id na ho to group source -> auto group, channel
+# source -> auto channel (pehle wala rule). Pehle auto-dest settings
+# chat_id ko override kar deta tha (run_batch me dest_override pehle
+# chalta tha), isliye settings ID set hone par bhi batch auto group /
+# channel me jata tha. Ab handler pehle hi settings ID ko dest bana
+# deta hai. Group source + channel dest ho to flat run_batch (folderwise
+# channel me nahi chalega); group dest ho to run_clone folderwise.
+# Galat chat_id ho to batch shuru hone se pehle saaf error milega.
+# Clone mode isse alag hai — wo hamesha naya group banata hai.
+# v113 (2026-11-18, on v112): ANIMATED FULL-COVER PROGRESS CARD.
+# Style (user ne choice mujh par chhodi — Typewriter + Dot Fill):
+# header TYPEWRITER — SRC BOT BY MR V -> VI -> VIL -> VILL -> VILLA ->
+# VILLAN, cursor ▌ ke saath; footer me VILLAN ke bagal wale black dots
+# BLINK karte hain (● <-> ○, har second); cover lines (top/divider/
+# bottom) ke right end par ➤ arrow hai (right face karke); right side
+# KHULA hai (koi right border nahi). Frame har edit par agla animation
+# frame dikhata hai (time-based), isliye card "move" karta hai. Box ki
+# chaudaai body ki sabse lambi line se banti hai, isliye type karte waqt
+# box hilta nahi. Sab kuch BOLD (har line _fancy() se). Numbers sab asli
+# hain — sirf look badla hai.
+VERSION = "v113"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -408,6 +442,11 @@ async def _backup_restore_all():
         "channels.json": CHANNELS_FILE,
         "free_used.json": FREE_FILE,
         "batch_resume.json": BATCH_RESUME_FILE,
+        # v111 FIX: auto_dest.json yahan MISSING tha — backup to hota tha
+        # (_BACKUP_KNOWN me hai), par restore kabhi hota hi nahi tha,
+        # isliye restart par mapping gayab ho jati thi aur naya group /
+        # channel ban jata tha. Ab restore hoga — purana dest reuse hoga.
+        "auto_dest.json": AUTO_DEST_FILE,
     }
     for fname, path in stores.items():
         try:
@@ -860,10 +899,10 @@ async def progress_bar(
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
 
-    # v110: ARROW design (user ne 20 me se chuna) — sab kuch BOLD.
-    # Bar: ▶ filled, ▷ khaali (10 blocks). Har line _fancy() se guzarti
-    # hai, isliye saare akshar + number bold dikhte hain. Numbers sab
-    # asli hain (bytes/speed/ETA/counts) — sirf look badla hai.
+    # v113: ANIMATED FULL-COVER FRAME — Typewriter header + blinking
+    # footer dots + right-end ➤ arrows, right side open. Har line
+    # _fancy() se guzarti hai, isliye saare akshar + number bold dikhte
+    # hain. Numbers sab asli hain (bytes/speed/ETA/counts).
     filled = int(percentage // 10)
     _bar = "▶" * filled + "▷" * (10 - filled)
 
@@ -877,7 +916,7 @@ async def progress_bar(
     # UPLOADING ya DOWNLOADING
     op = "UPLOADING" if "Upload" in (action_title or "") else "DOWNLOADING"
 
-    lines = [
+    _body = [
         _fancy(f"➤ {op} ➤ {percentage:.0f}%"),
         "",
         _bar,
@@ -888,8 +927,27 @@ async def progress_bar(
     ]
     if stats is not None and getattr(stats, "total", 0):
         _cur = min(stats.done + 1, stats.total)
-        lines.append(_fancy(
+        _body.append(_fancy(
             f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ❌ {stats.fail}"))
+    # Animation frame: har second agla frame (time-based) — har edit par
+    # card badalta hai, isliye text "move" karta hai.
+    _type_frames = ["V▌", "VI▌", "VIL▌", "VILL▌", "VILLA▌", "VILLAN"]
+    _fi = int(time.time()) % len(_type_frames)
+    _header = _fancy(f"SRC BOT BY MR {_type_frames[_fi]}")
+    # Footer black dots blink: ek second ●, agle second ○.
+    _dots_on = (int(time.time()) % 2 == 0)
+    _footer = _fancy("● ○ ○ VILLAN ○ ○ ●" if _dots_on
+                     else "○ ○ ○ VILLAN ○ ○ ○")
+    # Box ki chaudaai body ki sabse lambi line se — type karte waqt box
+    # hilta nahi. Right side khula hai (koi right border nahi); cover
+    # lines (top/divider/bottom) ke right end par ➤ arrow hai.
+    _w = max(len(x) for x in [_header] + _body + [_footer])
+    _top = "╔" + "═" * (_w + 2) + "➤"
+    _div = "╠" + "═" * (_w + 2) + "➤"
+    _bot = "╚" + "═" * (_w + 2) + "➤"
+    lines = [_top, "║ " + _header.center(_w), _div]
+    lines += ["║ " + x for x in _body]
+    lines += [_div, "║ " + _footer.center(_w), _bot]
     _text = "\n".join(lines)
     await safe_edit(message, _text)
     if dest_msg is not None:
@@ -2798,12 +2856,22 @@ async def _get_or_create_auto_group(client, userbot, uid, src_title):
     ent = _auto_dest_entry(data, uid)
     slot = ent.get("group") or {}
     if slot.get("chat_id"):
-        try:
-            await userbot.get_chat(slot["chat_id"])
+        _ok = False
+        for _att in range(2):
+            try:
+                await userbot.get_chat(slot["chat_id"])
+                _ok = True
+                break
+            except Exception as e:
+                if _att == 0:
+                    # v111: pehli baar transient fail ho sakta hai
+                    # (startup/network) — 3s ruk ke ek baar aur try karo.
+                    print(f"[AUTO-GROUP] saved group check retry ({e})", flush=True)
+                    await asyncio.sleep(3)
+        if _ok:
             return slot["chat_id"], False, slot.get("title") or "Saved"
-        except Exception:
-            print(f"[AUTO-GROUP] saved group {slot['chat_id']} nahi khul raha — naya banega", flush=True)
-            ent.pop("group", None)
+        print(f"[AUTO-GROUP] saved group {slot['chat_id']} nahi khul raha — naya banega", flush=True)
+        ent.pop("group", None)
     title = f"{(src_title or 'VILLAN').strip()[:100]} • Saved"
     about = f"📂 Saved from {src_title or 'group'} • Powered by VILLAN"[:255]
     try:
@@ -6077,6 +6145,9 @@ async def help_handler(client, message):
         "• v108 — Range UNLIMITED (5000 wala cap hata); dusri link se end ID (pehli link phir dusri link wala flow wapas); topic link ka start fix.\n"
         "• v109 — Dest progress card: auto channel/group me bhi uploading + speed + File X/Y dikhega (stylish).\n"
         "• v110 — Progress card ARROW design (20 me se chuna): sab kuch bold, ▶/▷ bar.\n"
+        "• v111 — Restart fix: auto-dest group/channel ab backup se wapas aayega, restart par dusra group nahi banega.\n"
+        "• v112 — Dest rule: /settings me chat ID set ho to batch wahi jayega (auto-dest nahi chalega); na ho to group -> auto group, channel -> auto channel.\n"
+        "• v113 — Progress card animated: SRC BOT BY MR VILLAN typewriter, blinking dots, right-end ➤ arrows (right side open).\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -7923,6 +7994,11 @@ async def message_dispatcher(client, message):
             return
         _src = _st["chat_id"]
         _is_pub = _st.get("is_public", isinstance(_src, str))
+        # v112 DEST RULE: /settings me chat_id set ho to batch WAHI
+        # jayega — auto-dest (group/channel) bilkul nahi chalega. Chat_id
+        # na ho to group source -> auto group, channel source -> auto
+        # channel (pehle wala rule).
+        _set_dest = get_settings(user_id).get("chat_id")
         if _st.get("mode") == "clone":
             # v100: CLONE mode — naya private group banega (run_clone).
             USER_STATES.pop(user_id, None)
@@ -7962,15 +8038,55 @@ async def message_dispatcher(client, message):
             if _ub3 is None:
                 await message.reply_text("❌ Group se nikalne ke liye pehle `/login` karo.")
                 return
-            _gid, _gnew, _gtitle = await _get_or_create_auto_group(
-                client, _ub3, user_id, _st.get("name"))
-            if not _gid:
-                await message.reply_text("❌ Apna group nahi ban paya — dobara try karo.")
-                return
+            if _set_dest:
+                # v112: settings chat_id set hai — wahi dest hai. Type
+                # check karo: channel ho to folderwise nahi chalega, isliye
+                # run_batch (flat) se wahan bhej do; group ho to run_clone
+                # folderwise. ID hi galat ho to saaf error deke roko.
+                _sd_type = None
+                try:
+                    _sd = await _ub3.get_chat(_set_dest)
+                    _sd_type = str(getattr(_sd, "type", "")).lower()
+                except Exception:
+                    await message.reply_text(
+                        "❌ Settings me jo chat ID hai wo khul nahi raha — ID galat hai ya tumhara account usme nahi hai.\n"
+                        "/settings se sahi ID dalo, ya hata do (phir auto group chalega).")
+                    return
+                if "channel" in _sd_type:
+                    _brs = _rs if _rs is not None else 1
+                    _bre = _re
+                    if _bre is None:
+                        try:
+                            async for _m in _ub3.get_chat_history(_src, limit=1):
+                                _bre = _m.id
+                                break
+                        except Exception:
+                            _bre = None
+                        if not _bre:
+                            await message.reply_text("❌ History nahi mili — source check karo, phir dobara `/batch` karo.")
+                            return
+                    status_msg = await message.reply_text(
+                        "🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\n"
+                        f"📂 {_fancy('Dest')}: `{_set_dest}` (settings chat ID — flat)"
+                    )
+                    await run_batch(client, user_id, _src, _brs, _bre, status_msg,
+                                    public_fast=_is_pub,
+                                    only_topic=_st.get("only_topic"),
+                                    dest_override=_set_dest)
+                    return
+                _gid, _gnew, _gtitle = _set_dest, False, str(_set_dest)
+                _dest_note = " (settings chat ID, folderwise)"
+            else:
+                _gid, _gnew, _gtitle = await _get_or_create_auto_group(
+                    client, _ub3, user_id, _st.get("name"))
+                if not _gid:
+                    await message.reply_text("❌ Apna group nahi ban paya — dobara try karo.")
+                    return
+                _dest_note = (" (bot admin ✅, folderwise)"
+                              + (" — naya banaya" if _gnew else " — wahi purana"))
             status_msg = await message.reply_text(
                 "🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\n"
-                f"📂 {_fancy('Dest Group')}: `{_gtitle}` (bot admin ✅, folderwise)"
-                + (" — naya banaya" if _gnew else " — wahi purana")
+                f"📂 {_fancy('Dest Group')}: `{_gtitle}`{_dest_note}"
             )
             await run_clone(client, user_id, _src, status_msg,
                             only_topic=_fold, range_start=_rs, range_end=_re,
@@ -8011,17 +8127,32 @@ async def message_dispatcher(client, message):
         _dest_override = None
         _auto_line = ""
         if not _st.get("is_group") and _st.get("mode") != "clone":
-            _ub2 = await get_userbot(user_id)
-            if _ub2 is not None:
-                _dest_override, _auto_new, _auto_title = await _get_or_create_auto_dest(
-                    client, _ub2, user_id, _st.get("name"))
-                if _dest_override:
-                    _auto_line = (f"\n📂 {_fancy('Dest Channel')}: `{_auto_title}`"
-                                  f" (bot admin ✅, pin-copy ON)"
-                                  + (" — naya banaya" if _auto_new else " — wahi purana"))
+            if _set_dest:
+                # v112: settings chat_id set hai — wahi dest, auto channel
+                # bilkul nahi banega. Bot ko us chat me dekhna chahiye,
+                # warna wahan bhej nahi payega — pehle hi check kar lo.
+                try:
+                    await client.get_chat(_set_dest)
+                except Exception:
+                    await message.reply_text(
+                        "❌ Settings me jo chat ID hai wo khul nahi raha — bot usme nahi hai ya ID galat hai.\n"
+                        "/settings se sahi ID dalo, ya hata do (phir auto channel chalega).")
+                    return
+                _dest_override = _set_dest
+                _auto_line = (f"\n📂 {_fancy('Dest')}: `{_set_dest}`"
+                              " (settings chat ID)")
             else:
-                _auto_line = ("\nℹ️ Auto channel ke liye `/login` karo — "
-                              "is baar personal chat me bhej raha hun.")
+                _ub2 = await get_userbot(user_id)
+                if _ub2 is not None:
+                    _dest_override, _auto_new, _auto_title = await _get_or_create_auto_dest(
+                        client, _ub2, user_id, _st.get("name"))
+                    if _dest_override:
+                        _auto_line = (f"\n📂 {_fancy('Dest Channel')}: `{_auto_title}`"
+                                      f" (bot admin ✅, pin-copy ON)"
+                                      + (" — naya banaya" if _auto_new else " — wahi purana"))
+                else:
+                    _auto_line = ("\nℹ️ Auto channel ke liye `/login` karo — "
+                                  "is baar personal chat me bhej raha hun.")
         USER_STATES.pop(user_id, None)
         status_msg = await message.reply_text(
             f"🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\nBatch started — `{total_files}` items.{_auto_line}"
@@ -8256,6 +8387,9 @@ async def main():
     print("👉 V108: RANGE UNLIMITED (5000 cap hata) + dusri link se end ID + topic link start fix", flush=True)
     print("👉 V109: DEST PROGRESS — auto channel/group me bhi uploading + speed + File X/Y card", flush=True)
     print("👉 V110: PROGRESS CARD ARROW design (sab bold, ▶/▷ bar)", flush=True)
+    print("👉 V111: AUTO-DEST RESTORE FIX — restart par purana group/channel reuse hoga", flush=True)
+    print("👉 V112: DEST RULE — settings chat ID set ho to batch wahi, warna auto group/channel", flush=True)
+    print("👉 V113: ANIMATED PROGRESS CARD — typewriter VILLAN + blinking dots + right ➤", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
