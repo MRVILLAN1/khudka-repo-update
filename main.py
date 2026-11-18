@@ -303,7 +303,34 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # chat me File/speed/⏳ bacha nahi dikhta tha. Ab run_clone me bhi DM ka
 # per-file card (_dmprog) banta hai — download + upload dono ki progress
 # DM + dest dono jagah wahi card dikhayegi (progress_bar ka dest_msg).
-VERSION = "v116"
+# v117 (2026-11-18, on v116): CARD CHHOTA — 5 LINES HATA DI.
+# User ke live card par ab bhi bikhra hua lag raha tha (14 lines,
+# border wrap + divider/footer/bottom). Hataya: (1) header ke neeche
+# wala divider, (2) UPLOADING ke neeche blank line, (3) footer se pehle
+# wala divider, (4) footer (VILLAN dots blink — iske saath blink bhi
+# gaya; typewriter header ab bhi animate karta hai), (5) bottom border.
+# Bacha: top border + header (typewriter) + 7 body lines = 9 lines.
+# Right side aur neeche khula hai; border max 30 ═ (v116, no wrap).
+# DM stats fix (v116 _dmprog) isme pehle se hai — deploy karne par DM
+# me bhi wahi card + stats dikhenge.
+# v118 (2026-11-18, on v117): SPEED FIX — card edits upload ko block kar
+# rahe the. v115 me PROGRESS_EVERY 5s -> 1s hua (smooth animation ke
+# liye) aur v116 me clone me DM card bhi jud gaya — matlab har second
+# 2 message edits, aur Pyrogram upload agle chunk se PEHLE in edits ka
+# wait karta tha (har edit ~200ms), isliye upload speed gir gayi thi
+# (2.5 MB/s, Koyeb cap ~5 MB/s hote hue bhi). Ab beech wale edits
+# background task me hote hain (_edit_async, ek message par ek hi edit
+# in-flight) — upload kabhi edit ka wait nahi karta. Aakhri edit (100%)
+# ab bhi await hota hai, taaki wo "✅ Sent" se pehle pakka lag jaye.
+# Animation waisi hi smooth rahegi (1s tick, tick-based frame).
+# v119 (2026-11-18, on v118): FOOTER DOTS WAPAS — user ne kaha neeche
+# VILLAN wale dots bhi do-do badha do aur bari bari blink karao.
+# Footer wapas aaya (v117 me hataya tha): har side 5 dots (3 ki jagah),
+# ● ek-ek karke (bari bari) aage-peeche chalta hai — ping-pong
+# (bahar -> andar -> bahar, koi jump nahi), dono side mirror me.
+# Divider + footer wapas aaye (bottom border nahi) — card 11 lines.
+# Typewriter header + smooth animation + speed fix (v118) waise hi hain.
+VERSION = "v119"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -920,6 +947,25 @@ async def _premium_card(uid, bot_client=None):
     ])
 
 
+# v118: abhi edit ho rahe messages (id) — overlap rokne ke liye.
+_EDITING = set()
+
+
+async def _edit_async(msg, text):
+    """progress_bar ka edit background me — upload/download iska wait na kare.
+    Ek message par ek hi edit in-flight; dusra tick skip hoga (agla tick
+    phir try karega). safe_edit khud exceptions pakadta hai, isliye task
+    kabhi raise nahi karega."""
+    _k = id(msg)
+    if _k in _EDITING:
+        return
+    _EDITING.add(_k)
+    try:
+        await safe_edit(msg, text)
+    finally:
+        _EDITING.discard(_k)
+
+
 async def progress_bar(
     current, total, message, start_time, last_update, action_title,
     stats=None, uid=None, bot_client=None, dest_msg=None
@@ -937,10 +983,11 @@ async def progress_bar(
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
 
-    # v113: ANIMATED FULL-COVER FRAME — Typewriter header + blinking
-    # footer dots + right-end ➤ arrows, right side open. Har line
-    # _fancy() se guzarti hai, isliye saare akshar + number bold dikhte
-    # hain. Numbers sab asli hain (bytes/speed/ETA/counts).
+    # v113/v117/v119: ANIMATED FRAME — Typewriter header + footer dots
+    # (divider/footer v117 me hataye the, footer v119 me wapas — 5 dots
+    # har side, bari bari blink). Har line _fancy() se guzarti hai,
+    # isliye saare akshar + number bold dikhte hain. Numbers sab asli
+    # hain (bytes/speed/ETA/counts).
     filled = int(percentage // 10)
     _bar = "▶" * filled + "▷" * (10 - filled)
 
@@ -956,7 +1003,6 @@ async def progress_bar(
 
     _body = [
         _fancy(f"➤ {op} ➤ {percentage:.0f}%"),
-        "",
         _bar,
         _fancy(f"➤ Size: {humanbytes(current)} / {humanbytes(total)}"),
         _fancy(f"➤ Speed: {humanbytes(speed)}/s"),
@@ -970,33 +1016,40 @@ async def progress_bar(
         _body.append(_fancy(
             f"➤ File: {_cur}/{stats.total} • ✅ {stats.ok} • ⏳ {_left} • ❌ {stats.fail}"))
     # Animation frame: tick-based — har edit par ek kadam aage (typewriter
-    # ek akshar, dots har 2 edit par flip). DM + dest dono ko ek hi call
-    # me wahi frame milta hai.
+    # ek akshar). DM + dest dono ko ek hi call me wahi frame milta hai.
     _type_frames = ["V▌", "VI▌", "VIL▌", "VILL▌", "VILLA▌", "VILLAN"]
     _fi = _tick % len(_type_frames)
     _header = _fancy(f"SRC BOT BY MR {_type_frames[_fi]}")
-    # Footer black dots blink: 2 edit ●, 2 edit ○ (shant blink).
-    _dots_on = ((_tick // 2) % 2 == 0)
-    _footer = _fancy("● ○ ○ VILLAN ○ ○ ●" if _dots_on
-                     else "○ ○ ○ VILLAN ○ ○ ○")
-    # Box ki chaudaai body ki sabse lambi line se — type karte waqt box
-    # hilta nahi. Right side khula hai (koi right border nahi); cover
-    # lines (top/divider/bottom) ke right end par ➤ arrow hai.
+    # v119: footer wapas — har side 5 dots (3 ki jagah), ● ek-ek karke
+    # (bari bari) aage-peeche chalta hai (ping-pong: bahar -> andar ->
+    # bahar, koi jump nahi). Dono side mirror me chalte hain.
+    _ping = [0, 1, 2, 3, 4, 3, 2, 1]
+    _p = _ping[_tick % len(_ping)]
+    _ld = ["●" if i == _p else "○" for i in range(5)]
+    _rd = ["●" if i == (4 - _p) else "○" for i in range(5)]
+    _footer = _fancy(f"{' '.join(_ld)} VILLAN {' '.join(_rd)}")
+    # v117: card chhota rakha tha (divider/footer/bottom hataye the);
+    # v119 me sirf divider + footer wapas aaye (bottom border nahi).
+    # Right side aur neeche khula hai; border max 30 ═ (phone par wrap
+    # nahi hoga).
     _w = max(len(x) for x in [_header] + _body + [_footer])
-    # v116: border max 30 ═ — lambi line phone par wrap ho jati thi aur ➤
-    # agle line par gir jata tha. Header/footer bhi isi chaudaai par
-    # center honge, taaki border se align rahen.
     _bw = min(_w, 30)
     _top = "╔" + "═" * _bw + "➤"
     _div = "╠" + "═" * _bw + "➤"
-    _bot = "╚" + "═" * _bw + "➤"
-    lines = [_top, "║ " + _header.center(_bw), _div]
+    lines = [_top, "║ " + _header.center(_bw)]
     lines += ["║ " + x for x in _body]
-    lines += [_div, "║ " + _footer.center(_bw), _bot]
+    lines += [_div, "║ " + _footer.center(_bw)]
     _text = "\n".join(lines)
-    await safe_edit(message, _text)
-    if dest_msg is not None:
-        await safe_edit(dest_msg, _text)
+    # v118 SPEED: beech wale edits background me — upload inka wait na kare.
+    # Aakhri edit (100%) await karo, taaki wo "✅ Sent" se pehle pakka lage.
+    if current == total:
+        await safe_edit(message, _text)
+        if dest_msg is not None:
+            await safe_edit(dest_msg, _text)
+    else:
+        asyncio.create_task(_edit_async(message, _text))
+        if dest_msg is not None:
+            asyncio.create_task(_edit_async(dest_msg, _text))
 
 
 def parse_tg_link(link: str):
@@ -6228,6 +6281,9 @@ async def help_handler(client, message):
         "• v114 — Card fix: cover lines 2 chhoti (end ➤ ab text ke edge par), File line + status me ⏳ Bacha dikhega.\n"
         "• v115 — Smooth animation: typewriter/blink ab har edit par ek kadam aage (pehle ulta chalta tha), card har 1s update.\n"
         "• v116 — Card fix: border max 30 (phone par wrap nahi hoga), clone batch me DM me bhi wahi progress card + stats.\n"
+        "• v117 — Card chhota: 5 lines hata di (divider/footer/bottom) — sirf top border + header + progress lines.\n"
+        "• v118 — Speed fix: card edits ab background me (upload kabhi edit ka wait nahi karega), speed wapas ~4-5 MB/s.\n"
+        "• v119 — Footer wapas: har side 5 dots, ● bari bari aage-peeche chalta hai (ping-pong blink).\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -8473,6 +8529,9 @@ async def main():
     print("👉 V114: CARD FIX — cover lines chhoti, File line + status me Bacha count", flush=True)
     print("👉 V115: SMOOTH ANIMATION — typewriter/blink har edit par ek kadam, card 1s update", flush=True)
     print("👉 V116: CARD FIX — border max 30 (no wrap), clone DM me bhi progress card", flush=True)
+    print("👉 V117: CARD CHHOTA — 5 lines hata di, sirf top border + header + progress", flush=True)
+    print("👉 V118: SPEED FIX — card edits background me, upload kabhi wait nahi karega", flush=True)
+    print("👉 V119: FOOTER WAPAS — 5 dots har side, ● bari bari ping-pong blink", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
