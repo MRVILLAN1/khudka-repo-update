@@ -375,7 +375,19 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # isko lega ya skip karega. Isse pata chalega bot galat chat padh raha
 # hai ya message hi content-less aa raha hai. Saath me run_batch ab
 # shuru hote hi log me source ka naam/ID/type likhega.
-VERSION = "v124"
+# v125 (2026-11-19, on v124): /check RAW MEDIA TYPE — user ne kaha
+# video hone par bhi /check nahi bata raha, code me 100% gadbad hai.
+# Recheck kiya (Pyrogram 2.0.106 source padh kar): get_messages aur
+# _info_from_msg sahi hain, par Message._parse me koi bhi media type
+# jo is version ko nahi pata (jaise paid/locked media — Stars) use
+# 'else: media = None' kar deta hai. Server purane Layer 158 wale
+# client ko paid media MessageMediaUnsupported bhejta hai, aur wo
+# _parse me media=None ho jata hai — isliye video hone par bhi
+# NO MEDIA/TEXT aata hai. /check ab raw API (channels.GetMessages)
+# se asal media type bhi dikhata hai: MessageMediaUnsupported mile to
+# saaf likhega ki ye PAID/LOCKED media hai aur bot bina unlock kiye
+# download nahi kar sakta.
+VERSION = "v125"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -6440,6 +6452,7 @@ async def help_handler(client, message):
         "• v122 — Fail fix: khaali message par card nahi banega (fetch pehle), rate limit ka load kam.\n"
         "• v123 — /batch hata diya: batch ab sirf Start Forwarding se (button); pehle se auto channel/group ho to poochhega — purana wala ya naya banao (source ke naam se).\n"
         "• v124 — /check diagnostic: ek message ka link do, bot batayega usme use kya dikhta hai (video/photo/text/khaali) + batch shuru hote hi log me source ka naam aayega.\n"
+        "• v125 — /check ab RAW media type bhi dikhata hai: paid/locked video (Stars) MessageMediaUnsupported aayega, to saaf pata chalega bot use kyun nahi dekh sakta.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -6519,9 +6532,11 @@ async def batch_start_handler(client, message):
 
 @app.on_message(filters.command("check") & filters.private)
 async def check_handler(client, message):
-    """v124: /check — ek message ka link do, bot batayega use kya dikhta hai.
-    Batch me NO MEDIA/TEXT fail ho raha ho to pehle /check se dekho:
-    video dikhta hai ya nahi, aur bot kaun si chat padh raha hai."""
+    """v125: /check — ek message ka link do, bot batayega use kya dikhta hai.
+    Batch me NO MEDIA/TEXT fail ho raha ho to pehle /check se dekho.
+    v125: RAW media type bhi dikhata hai — paid/locked video purane
+    Pyrogram (Layer 158) ko MessageMediaUnsupported dikhta hai, isliye
+    bot use dekh nahi pata."""
     uid = message.chat.id
     if not await _has_joined(uid, force=True):
         await _send_join_wall(message)
@@ -6575,10 +6590,32 @@ async def check_handler(client, message):
     has_cap = bool(getattr(m, "caption", None))
     is_empty = bool(getattr(m, "empty", False))
     is_service = getattr(m, "service", None) is not None
+    # v125: RAW media type — server ne asal me kya bheja. Paid/locked
+    # video (Stars) purane Pyrogram ko MessageMediaUnsupported dikhta hai;
+    # _parse use media=None kar deta hai, isliye NO MEDIA/TEXT aata hai.
+    raw_media = "—"
+    raw_err = None
+    try:
+        from pyrogram import raw as _praw
+        _peer = await fetch_client.resolve_peer(chat_id)
+        if isinstance(_peer, _praw.types.InputPeerChannel):
+            _rpc = _praw.functions.channels.GetMessages(
+                channel=_peer, id=[_praw.types.InputMessageID(id=preset)])
+        else:
+            _rpc = _praw.functions.messages.GetMessages(
+                id=[_praw.types.InputMessageID(id=preset)])
+        _res = await fetch_client.invoke(_rpc)
+        _rms = getattr(_res, "messages", []) or []
+        if _rms:
+            _rm = _rms[0]
+            _rm_media = getattr(_rm, "media", None)
+            raw_media = type(_rm_media).__name__ if _rm_media is not None else "None (koi media nahi)"
+    except Exception as _re:
+        raw_err = str(_re)[:150].replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("`", "")
     would_take = bool(media) or has_text
     verdict = ("✅ Batch isko lega" if would_take
                else "❌ Batch isko SKIP karega (NO MEDIA/TEXT)")
-    await message.reply_text(
+    _reply = (
         f"🔍 **/check result — msg {preset}**\n\n"
         f"**Source:** {ctitle}\n"
         f"**Type:** {ctype}" + (" (forum)" if is_forum else "") + "\n"
@@ -6587,9 +6624,20 @@ async def check_handler(client, message):
         f"**Service message hai:** {'haan' if is_service else 'nahi'}\n"
         f"**Media:** {media_s}\n"
         f"**Text hai:** {'haan' if has_text else 'nahi'}\n"
-        f"**Caption hai:** {'haan' if has_cap else 'nahi'}\n\n"
-        f"{verdict}",
-        parse_mode=enums.ParseMode.MARKDOWN)
+        f"**Caption hai:** {'haan' if has_cap else 'nahi'}\n"
+        f"**Raw media type:** {raw_media}\n\n"
+        f"{verdict}"
+    )
+    if raw_media == "MessageMediaUnsupported":
+        _reply += (
+            "\n\n⚠️ **Ye video PAID/LOCKED media hai** (ya aisa naya type jo is "
+            "purane Pyrogram ko nahi dikhta). Telegram me kholo to is par "
+            "Stars wala lock dikhega. Bot ise bina unlock kiye download nahi "
+            "kar sakta."
+        )
+    if raw_err:
+        _reply += f"\n\n(Raw check me error: `{raw_err}`)"
+    await message.reply_text(_reply, parse_mode=enums.ParseMode.MARKDOWN)
 
 
 @app.on_message(filters.command("clone") & filters.private)
@@ -8815,6 +8863,7 @@ async def main():
     print("👉 V122: FAIL FIX — khaali message par card nahi banega, fetch pehle", flush=True)
     print("👉 V123: /batch HATA — batch sirf Start Forwarding se; pehle se auto dest ho to purana/naya poochhega", flush=True)
     print("👉 V124: /check DIAGNOSTIC — ek message link do, bot batayega use kya dikhta hai (media/text/khaali)", flush=True)
+    print("👉 V125: /check RAW MEDIA — paid/locked video ka asal type dikhega (MessageMediaUnsupported = Stars lock)", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
