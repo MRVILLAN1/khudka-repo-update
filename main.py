@@ -1,3 +1,4 @@
+
 import os
 import re
 import time
@@ -344,7 +345,29 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # ek kadam). Header ki lambai har frame me same rehti hai (spinner sirf
 # glyph badalta hai), isliye card hilta nahi. Footer dots (5-5, ping-pong),
 # 14-line card, border 24, speed fix (v118), DM card (v116) waise hi.
-VERSION = "v121"
+# v122 (2026-11-19, on v121): FAILING BATCH FIX — user ke log me msg
+# 16-68 sab NO MEDIA/TEXT se fail ho rahe the, aur beech me EditMessage
+# FloodWait (36s/60s/33s) aa raha tha. Wajah: inline path me har file par
+# fetch se PEHLE hi DM + dest me "Preparing…" card banta tha (2 send +
+# 2 delete har file par) — chahe file khaali hi kyun na ho. Khaali file
+# par wo card bekaar rehta tha aur API call ki bheed se rate limit ka
+# risk badhta tha. Ab fetch PEHLE hota hai; card sirf tab banta hai jab
+# file asli ho (neeche "HAR FILE ke liye NAYA progress message" wala
+# block). Fail hone wali file par ab sirf status update hota hai (3s
+# throttle waise hi). NO MEDIA/TEXT khud code bug nahi hai — wo messages
+# source me hi khaali/deleted hain.
+# v123 (2026-11-19, on v122): (1) /batch HATA DIYA — batch ab sirf
+# Start Forwarding se niklega (/start -> "Start Forwarding Now" button
+# -> Public/Private mode -> link). /batch likhne par stub batayega.
+# BotCommand menu se "batch" hata, COMMANDS_TEXT + /help + saare
+# "/batch likho" wale messages Start Forwarding ki taraf badle.
+# (2) DEST CHOICE — batch jab pehle se bane auto channel/group par
+# jane wala ho to POOCHHEGA: "Purana wala" ya "Naya banao" (naya source
+# ke naam se banega). Settings chat_id set ho to sawal nahi (v112 rule).
+# Clone mode me sawal nahi (clone hamesha naya group banata hai).
+# Choice WAITING_DEST_CHOICE state me save hoti hai; button dabane par
+# _resume_dest_choice batch wahi se shuru karta hai.
+VERSION = "v123"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -2814,7 +2837,7 @@ async def _handle_resume(client, uid, trigger_msg):
         return
     entry = _batch_get_progress(uid)
     if not entry:
-        await client.send_message(uid, "❌ Koi ruka hua batch nahi mila. Naya batch chalane ke liye `/batch` ya `/public` use karo.")
+        await client.send_message(uid, "❌ Koi ruka hua batch nahi mila. Naya batch chalane ke liye /start karo aur 'Start Forwarding Now' dabao.")
         return
     src_chat = entry.get("src_chat")
     end_id = entry.get("end_id")
@@ -2923,6 +2946,37 @@ def _auto_dest_entry(data, uid):
     return {}
 
 
+def _auto_dest_existing(uid, kind):
+    """v123: auto-dest ka pehle se bana slot lao (kind: 'channel'/'group').
+    Returns (chat_id, title) ya (None, None)."""
+    try:
+        data = _load_json(AUTO_DEST_FILE, {})
+        ent = _auto_dest_entry(data, uid)
+        slot = ent.get(kind) or {}
+        if slot.get("chat_id"):
+            return slot["chat_id"], slot.get("title") or "Saved"
+    except Exception:
+        pass
+    return None, None
+
+
+def _auto_dest_clear_slot(uid, kind):
+    """v123: auto-dest ka slot mapping se hatao (naya banane ke liye).
+    Purana channel/group DELETE nahi hota — sirf mapping hat-ti hai,
+    isliye purana dest safe rehta hai."""
+    try:
+        data = _load_json(AUTO_DEST_FILE, {})
+        ent = _auto_dest_entry(data, uid)
+        if kind in ent:
+            ent.pop(kind, None)
+            data[str(uid)] = ent
+            _save_json(AUTO_DEST_FILE, data)
+            return True
+    except Exception as e:
+        print(f"[AUTO-DEST] clear slot fail: {e}", flush=True)
+    return False
+
+
 async def _get_or_create_auto_dest(client, userbot, uid, src_title):
     """v103: channel slot — ek ID ke liye EK hi auto dest channel.
     Pehli baar: source ke naam par naya PRIVATE channel banao (userbot
@@ -3013,6 +3067,89 @@ async def _get_or_create_auto_group(client, userbot, uid, src_title):
     except Exception as e:
         print(f"[AUTO-GROUP] bot admin fail: {e}", flush=True)
     return cid, True, title
+
+
+async def _resume_dest_choice(client, query, choice):
+    """v123: dest-choice button (dest_old/dest_new) ka jawab — ruka hua
+    batch wahi se shuru karo. ctx USER_STATES se aata hai (WAITING_RANGE
+    ne save kiya tha). choice: 'old' (purana dest reuse) ya 'new' (slot
+    hata ke source ke naam se naya dest banao)."""
+    uid = query.from_user.id
+    ctx = USER_STATES.get(uid) or {}
+    if ctx.get("step") != "WAITING_DEST_CHOICE":
+        try:
+            await query.answer("Ye choice ab purani ho gayi — dobara batch shuru karo.", show_alert=True)
+        except Exception:
+            pass
+        return
+    USER_STATES.pop(uid, None)
+    kind = ctx.get("kind")
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.message.edit_text(
+            "✅ Choice mil gayi — batch shuru ho raha hai…",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    except Exception:
+        pass
+    if kind == "group":
+        _src = ctx["src"]
+        _ub = await get_userbot(uid)
+        if _ub is None:
+            await client.send_message(uid, "❌ Group se nikalne ke liye pehle `/login` karo.")
+            return
+        if choice == "new":
+            _auto_dest_clear_slot(uid, "group")
+            _gid, _gnew, _gtitle = await _get_or_create_auto_group(
+                client, _ub, uid, ctx.get("name"))
+            if not _gid:
+                await client.send_message(uid, "❌ Apna group nahi ban paya — dobara try karo.")
+                return
+            _dest_note = " (bot admin ✅, folderwise — naya banaya)"
+        else:
+            _gid, _gnew, _gtitle = ctx["old_id"], False, ctx.get("old_title") or "Saved"
+            _dest_note = " (bot admin ✅, folderwise — wahi purana)"
+        status_msg = await client.send_message(
+            uid,
+            "🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\n"
+            f"📂 {_fancy('Dest Group')}: `{_gtitle}`{_dest_note}"
+        )
+        await run_clone(client, uid, _src, status_msg,
+                        only_topic=ctx.get("fold"), range_start=ctx.get("rs"),
+                        range_end=ctx.get("re"),
+                        dest_override=_gid, dest_title=_gtitle, mode_label="Extract")
+        return
+    # kind == "channel"
+    _src = ctx["src"]
+    if choice == "new":
+        _auto_dest_clear_slot(uid, "channel")
+        _ub = await get_userbot(uid)
+        if _ub is not None:
+            _dest_override, _auto_new, _auto_title = await _get_or_create_auto_dest(
+                client, _ub, uid, ctx.get("name"))
+            if not _dest_override:
+                await client.send_message(uid, "❌ Apna channel nahi ban paya — dobara try karo.")
+                return
+            _auto_line = (f"\n📂 {_fancy('Dest Channel')}: `{_auto_title}`"
+                          " (bot admin ✅, pin-copy ON) — naya banaya")
+        else:
+            await client.send_message(uid, "❌ Auto channel ke liye `/login` karo.")
+            return
+    else:
+        _dest_override = ctx["old_id"]
+        _auto_title = ctx.get("old_title") or "Saved"
+        _auto_line = (f"\n📂 {_fancy('Dest Channel')}: `{_auto_title}`"
+                      " (bot admin ✅, pin-copy ON) — wahi purana")
+    status_msg = await client.send_message(
+        uid,
+        f"🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\nBatch started — `{ctx.get('total', 0)}` items.{_auto_line}"
+    )
+    await run_batch(client, uid, _src, ctx["start"], ctx["end"], status_msg,
+                    public_fast=ctx.get("is_pub", False),
+                    only_topic=ctx.get("only_topic"),
+                    dest_override=_dest_override)
 
 
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, public_fast=False, only_topic=None, dest_override=None):
@@ -3183,42 +3320,17 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
                             pending_holder = None
                     holder = {}
                     holders.append(holder)
-                    # v90: pehli file ka download CHAT par mat dikhao.
-                    # v51 me ye dikhane laga tha, isliye user ko DOWNLOAD
-                    # dikhta tha aur lagta tha uploading toota hai. Ab
-                    # prog_msg sirf Preparing... ke liye banega, download
-                    # prog_msg=None se silent hoga (jaise background wali
-                    # files ka hota hai, log me [DOWNLOAD] line rahegi),
-                    # phir upload_one isi message par UPLOADING dikhayega.
-                    # Video wala look wapas: Preparing... -> UPLOADING -> Done.
-                    if prog_msg:
-                        try:
-                            await prog_msg.delete()
-                        except Exception:
-                            pass
-                    try:
-                        prog_msg = await client.send_message(
-                            owner_id, "⏳ Preparing…",
-                            parse_mode=enums.ParseMode.MARKDOWN)
-                    except Exception:
-                        prog_msg = None
-                    # v109: dest (auto channel/group) me bhi progress card.
-                    if dest_prog_msg:
-                        try:
-                            await dest_prog_msg.delete()
-                        except Exception:
-                            pass
-                    dest_prog_msg = None
-                    if dest_chat != owner_id:
-                        try:
-                            dest_prog_msg = await client.send_message(
-                                dest_chat, "⏳ Preparing…",
-                                parse_mode=enums.ParseMode.MARKDOWN)
-                        except Exception:
-                            dest_prog_msg = None
-                    early_prog = True
+                    # v122: fetch PEHLE — khaali/deleted message par prog_msg
+                    # mat banao. (pehle har file par DM + dest me "Preparing…"
+                    # banta tha, chahe file fail hi kyun na ho — wo card
+                    # bekaar rehta tha aur send/delete ki bheed se rate
+                    # limit (FloodWait) ka risk badhta tha. Ab card sirf
+                    # tab banta hai jab file asli ho — neeche "HAR FILE ke
+                    # liye NAYA progress message" wala block banata hai.)
                     # v90: _prepare ko prog_msg mat do — download silent rahe
+                    # (DM me DOWNLOAD nahi dikhna chahiye).
                     info = await _prepare(mid, pre, holder, None)
+                    early_prog = False
                 if cancel_event.is_set():
                     break
                 if info == "PEER_INVALID":
@@ -5606,7 +5718,7 @@ COMMANDS_TEXT = (
     "𝐕𝐈𝐋𝐋𝐀𝐍 — 𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐬\n\n"
     "`/login` — Sign in with your number\n"
     "`/logout` — Sign out\n"
-    "`/batch` — Ek hi command: source ka link do, public/private/folder khud pehchan lega; channel se niklega to apna alag channel, group se niklega to apna alag group (folderwise) — ek ID = ek channel + ek group, bot admin + pin-copy\n"
+    "`/batch` — Hata diya gaya hai, batch ab /start -> Start Forwarding Now se niklega\n"
     "`/public` — Hata diya gaya hai, /batch use karo\n"
     "`/clone` — Hata diya gaya hai, /batch use karo\n"
     "`/create` — Naya group + folders banao\n"
@@ -6125,10 +6237,10 @@ async def free_handler(client, message):
     await message.reply_text(
         "🎉 **FREE trial mil gaya!**\n\n"
         f"• Sirf **{FREE_LIMIT} messages** nikal sakte ho (total, sab batches mila ke)\n"
-        "• `/batch` me range 10 se zyada di to wo shuru hi nahi hoga — chhota range do\n"
+        "• Batch me range 10 se zyada di to wo shuru hi nahi hoga — chhota range do\n"
         "• Ye **sirf ek baar** milta hai, dobara `/free` nahi chalega\n"
         "• Trial khatam hone par access band ho jayega, phir premium lena hoga\n\n"
-        "Shuru karo: `/batch` likho, pehli link bhejo, phir aakhri link bhejo (10 tak).",
+        "Shuru karo: /start karo aur 'Start Forwarding Now' dabao, pehli link bhejo, phir aakhri link bhejo (10 tak).",
         parse_mode=enums.ParseMode.MARKDOWN)
 
 
@@ -6150,7 +6262,7 @@ async def makeadmin_handler(client, message):
     if not _is_premium(uid):
         await message.reply_text(
             "⛔ Ye command sirf premium members ke liye hai.\n"
-            "Normal user /batch se save-restriction use kar sakta hai.")
+            "Normal user Start Forwarding se save-restriction use kar sakta hai.")
         return
     userbot = await get_userbot(uid)
     if not userbot:
@@ -6303,13 +6415,15 @@ async def help_handler(client, message):
         "• v119 — Footer wapas: har side 5 dots, ● bari bari aage-peeche chalta hai (ping-pong blink).\n"
         "• v120 — Poora card wapas (14 lines, user ke paste jaisa): border 24, footer 5 dots + blink waise hi.\n"
         "• v121 — Header naya: typewriter ki jagah ghumta spinner (◐◑◒◓) VILLAN ke pehle.\n"
+        "• v122 — Fail fix: khaali message par card nahi banega (fetch pehle), rate limit ka load kam.\n"
+        "• v123 — /batch hata diya: batch ab sirf Start Forwarding se (button); pehle se auto channel/group ho to poochhega — purana wala ya naya banao (source ke naam se).\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
-        "3. /batch — EK HI COMMAND (UNIFIED): source ka LINK bhejo (message link, channel/group link — ya Channel ID / @username bhi chalega). Bot khud pehchan lega — public channel ho to FAST copy, private ho to userbot se, folder wala group ho to poochhega: `extract` ya `clone`. Phir folder ka naam ya `all`, phir range: `100-500` likho, dusri message ki LINK bhejo (uska ID aakhri ID ban jayega), ek number likho, ya `all` likho — range UNLIMITED hai, koi 5000 wali limit nahi. CHANNEL se niklega to tumhare liye ek alag PRIVATE channel banega; GROUP se niklega to ek alag PRIVATE group banega (folderwise — source jaisi hi folders banengi, files wahi jayengi, plain group ki files General me jayengi). Ek ID par ek channel + ek group hi banega, dobara nahi banega — bot dono me auto-admin hoga, aur source me pinned ho to wahan bhi pin hoga. Auto-dest ke liye `/login` zaroori hai, warna personal chat me jayega. Files ek-ek karke, sequencewise aayengi, har file par download + upload progress dikhega.\n"
-        "4. /public — Hata diya gaya hai. Sab kuch /batch se hota hai: /batch likho, public channel ID do, fast copy khud hoga.\n"
-        "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya /batch chala diya, to resume latest batch ka hi hoga.\n"
-        "6. /clone — Hata diya gaya hai. Sab kuch /batch se hota hai: folder wale group se /batch karo, phir `clone` chuno — naya PRIVATE group tumhare account se banega, folders ke saath.\n"
+        "3. Batch (Start Forwarding se) — /batch hata diya gaya hai. Batch chalane ke liye `/start` karo, **🚀 Start Forwarding Now** dabao, Public ya Private chuno, phir source ka LINK bhejo (message link, channel/group link — ya Channel ID / @username bhi chalega). Bot khud pehchan lega — public channel ho to FAST copy, private ho to userbot se, folder wala group ho to poochhega: `extract` ya `clone`. Phir folder ka naam ya `all`, phir range: `100-500` likho, dusri message ki LINK bhejo (uska ID aakhri ID ban jayega), ek number likho, ya `all` likho — range UNLIMITED hai, koi 5000 wali limit nahi. CHANNEL se niklega to tumhare liye ek alag PRIVATE channel banega; GROUP se niklega to ek alag PRIVATE group banega (folderwise — source jaisi hi folders banengi, files wahi jayengi, plain group ki files General me jayengi). Pehle se auto channel/group bana ho to bot POOCHHEGA — purana wala use karun ya source ke naam se naya banaun. Bot dono me auto-admin hoga, aur source me pinned ho to wahan bhi pin hoga. Auto-dest ke liye `/login` zaroori hai, warna personal chat me jayega. Files ek-ek karke, sequencewise aayengi, har file par download + upload progress dikhega.\n"
+        "4. /public — Hata diya gaya hai. Sab kuch Start Forwarding se hota hai: /start karo, Start Forwarding Now dabao, Public chuno, public channel ID do, fast copy khud hoga.\n"
+        "5. /resume — Batch rukne par: batch rukte hi ek Resume Batch button wala message aayega, us button ko dabao ya /resume likho — batch wahi se shuru hoga jahan ruka tha, pehli file se nahi. Jo files pehle complete ho chuki hain (success ya fail, dono) wo dobara nahi aayengi, sirf aage ki bachi hui files aayengi. Agar beech me naya batch chala diya, to resume latest batch ka hi hoga.\n"
+        "6. /clone — Hata diya gaya hai. Sab kuch Start Forwarding se hota hai: folder wale group se Start Forwarding karo, phir `clone` chuno — naya PRIVATE group tumhare account se banega, folders ke saath.\n"
         "7. /create — Naya group banao: pehle group ka naam bhejo, phir topics ke naam ek hi message me (har naam ek line par, ya comma se) bhejo, un naam se folders ban jayenge.\n"
         "8a. /mkchannels — Public channels banao: /mkchannels likho, pehle NAAM bhejo (sab 10 me ek hi dikhega), phir DP photo bhejo ya skip karo (koi default DP nahi lagegi), phir BIO bhejo ya skip karo (koi default bio nahi lagegi), phir 10 username ek hi message me bhejo (line ya comma se). Sirf username alag-alag hoga. Naam + DP + bio sab channels par ek saath lag jayenge. Channel tumhare login account se banega, aur har naye channel me bot ko bhi admin + Post Messages bana diya jayega, taaki baad me bot se bhi broadcast ho sake.\n"
         "8b. /mychannels — Tumhare banaye channels ki list dekho.\n"
@@ -6370,44 +6484,23 @@ async def logout_handler(client, message):
 
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_start_handler(client, message):
-    if not await _has_joined(message.chat.id, force=True):
-        await _send_join_wall(message)
-        return
-    if not _is_allowed(message.chat.id):
-        await message.reply_text("⛔ Access denied.")
-        return
-    print(f"⚡ Processing /batch for user {message.chat.id}", flush=True)
-    ADDCHANNEL_STATES.pop(message.chat.id, None)
-    SENDALLRANGE_STATES.pop(message.chat.id, None)
-    MKCHANNELS_STATES.pop(message.chat.id, None)
-    SENDALL_STATES.pop(message.chat.id, None)
-    # Purani adhuri setting-input state ho to hatao, warna batch ka link
-    # galti se setting handler me chala jayega
-    SETTING_STATES.pop(message.chat.id, None)
-    CLONE_STATES.pop(message.chat.id, None)
-    PUBLIC_STATES.pop(message.chat.id, None)
-    USER_STATES[message.chat.id] = {"step": "WAITING_CHANNEL_ID"}
+    """v123: /batch HATA DIYA GAYA — batch ab sirf Start Forwarding se
+    niklega (/start -> 'Start Forwarding Now' button)."""
     await message.reply_text(
-        "🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\n\n"
-        "**STEP 1/2 — Source ka link bhejo**\n\n"
-        "Jaise:\n"
-        "• Message link — `https://t.me/channelname/123`\n"
-        "• Channel link — `https://t.me/channelname`\n"
-        "• Group link — `https://t.me/c/1234567890/123`\n\n"
-        "Ya Channel ID (`-1001234567890`) ya Username (`@channelname`) bhi chalega.\n\n"
-        "Public ho ya private, folder wala group ho ya channel — bot khud pehchan lega.\n\n"
-        "Cancel: `/cancel`",
-        parse_mode=enums.ParseMode.MARKDOWN,
-    )
+        "❌ `/batch` hata diya gaya hai.\n\n"
+        "Batch ab **Start Forwarding** se niklega:\n"
+        "• `/start` karo\n"
+        "• **🚀 Start Forwarding Now** dabao\n"
+        "• Public ya Private chuno, phir source ka link bhejo.")
 
 
 @app.on_message(filters.command("clone") & filters.private)
 async def clone_start_handler(client, message):
-    """v101: /clone HATA DIYA GAYA — sab /batch se hota hai."""
+    """v101: /clone HATA DIYA GAYA — sab Start Forwarding se hota hai."""
     await message.reply_text(
         "❌ `/clone` hata diya gaya hai.\n"
-        "Ab sab kuch `/batch` se hota hai — folder wale group se `/batch` karo, "
-        "phir `clone` chuno.")
+        "Ab sab kuch Start Forwarding se hota hai — folder wale group se "
+        "Start Forwarding karo, phir `clone` chuno.")
 
 
 @app.on_message(filters.command("create") & filters.private)
@@ -6453,7 +6546,7 @@ async def mkchannels_start_handler(client, message):
     if not _is_premium(message.chat.id):
         await message.reply_text(
             "⛔ Ye command sirf premium members ke liye hai.\n"
-            "Normal user /batch se save-restriction use kar sakta hai.")
+            "Normal user Start Forwarding se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /mkchannels for user {message.chat.id}", flush=True)
     ADDCHANNEL_STATES.pop(message.chat.id, None)
@@ -6625,7 +6718,7 @@ async def sendall_start_handler(client, message):
     if not _is_premium(message.chat.id):
         await message.reply_text(
             "⛔ Ye command sirf premium members ke liye hai.\n"
-            "Normal user /batch se save-restriction use kar sakta hai.")
+            "Normal user Start Forwarding se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /sendall for user {message.chat.id}", flush=True)
     ADDCHANNEL_STATES.pop(message.chat.id, None)
@@ -6667,7 +6760,7 @@ async def addchannel_start_handler(client, message):
     if not _is_premium(message.chat.id):
         await message.reply_text(
             "⛔ Ye command sirf premium members ke liye hai.\n"
-            "Normal user /batch se save-restriction use kar sakta hai.")
+            "Normal user Start Forwarding se save-restriction use kar sakta hai.")
         return
     print(f"⚡ Processing /addchannel for user {message.chat.id}", flush=True)
     USER_STATES.pop(message.chat.id, None)
@@ -6720,10 +6813,11 @@ async def sendallrange_start_handler(client, message):
 
 @app.on_message(filters.command("public") & filters.private)
 async def public_start_handler(client, message):
-    """v101: /public HATA DIYA GAYA — sab /batch se hota hai."""
+    """v101: /public HATA DIYA GAYA — sab Start Forwarding se hota hai."""
     await message.reply_text(
         "❌ `/public` hata diya gaya hai.\n"
-        "Ab sab kuch `/batch` se hota hai — `/batch` likho, channel ID do, "
+        "Ab sab kuch Start Forwarding se hota hai — /start karo, "
+        "'Start Forwarding Now' dabao, Public chuno, channel ID do, "
         "bot khud pehchan lega (public ho to fast copy).")
 
 
@@ -7163,6 +7257,10 @@ async def settings_handler(client, message):
 async def settings_callbacks(client, query):
     uid = query.from_user.id
     data = query.data or ""
+    if data in ("dest_old", "dest_new"):
+        # v123: dest choice — purana dest ya naya banao.
+        await _resume_dest_choice(client, query, "old" if data == "dest_old" else "new")
+        return
     if data.startswith("home_"):
         await _handle_home_callbacks(client, query, uid, data)
         return
@@ -7185,7 +7283,7 @@ async def settings_callbacks(client, query):
             "✅ **Destination set to Private Chat!**\n\n"
             "⚠️ Note: Telegram private chat (DM) mein bulk forwarding par 2 ghante ka FloodWait lag sakta hai. "
             "Bade batches ke liye Channel/Group banakar uski ID /setchannel se use karein.\n\n"
-            "Ab forwarding mode choose karein: /batch likho.",
+            "Ab /start karo aur 'Start Forwarding Now' dabao.",
             parse_mode=enums.ParseMode.MARKDOWN)
         return
     if data == "setchannel_cancel":
@@ -7948,7 +8046,7 @@ async def message_dispatcher(client, message):
             await message.reply_text(
                 "❌ **Ye private channel ka link hai!**\n"
                 "`/public` sirf public channel ke liye hai.\n"
-                "Private ke liye `/batch` use karo, ya public channel ka link bhejo.")
+                "Private ke liye /start karo aur 'Start Forwarding Now' dabao, ya public channel ka link bhejo.")
             return
 
         PUBLIC_STATES[user_id] = {
@@ -8121,6 +8219,17 @@ async def message_dispatcher(client, message):
 
     elif (
         user_id in USER_STATES
+        and USER_STATES[user_id].get("step") == "WAITING_DEST_CHOICE"
+    ):
+        # v123: dest choice ka intezar — button dabao (text se nahi).
+        await message.reply_text(
+            "👆 Upar wale buttons se chuno — **Purana wala** ya **Naya banao**.\n\n"
+            "Cancel karna ho to `/cancel` likho.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+        return
+
+    elif (
+        user_id in USER_STATES
         and USER_STATES[user_id].get("step") == "WAITING_RANGE"
     ):
         # v98 UNIFIED BATCH step 2: range -> run_batch (public/private/folder auto).
@@ -8218,7 +8327,7 @@ async def message_dispatcher(client, message):
                         except Exception:
                             _bre = None
                         if not _bre:
-                            await message.reply_text("❌ History nahi mili — source check karo, phir dobara `/batch` karo.")
+                            await message.reply_text("❌ History nahi mili — source check karo, phir dobara Start Forwarding se karo.")
                             return
                     status_msg = await message.reply_text(
                         "🔥 𝐏𝐑𝐎 𝐓𝐔𝐑𝐁𝐎 𝐓𝐑𝐀𝐍𝐒𝐅𝐄𝐑 𝐏𝐈𝐏𝐄𝐋𝐈𝐍𝐄 🔥\n"
@@ -8232,6 +8341,31 @@ async def message_dispatcher(client, message):
                 _gid, _gnew, _gtitle = _set_dest, False, str(_set_dest)
                 _dest_note = " (settings chat ID, folderwise)"
             else:
+                # v123: pehle se auto group bana ho to POOCHO — purana
+                # use karun ya naya banaun? (naya source ke naam se banega)
+                _old_gid, _old_gtitle = _auto_dest_existing(user_id, "group")
+                if _old_gid:
+                    USER_STATES[user_id] = {
+                        "step": "WAITING_DEST_CHOICE", "kind": "group",
+                        "old_id": _old_gid, "old_title": _old_gtitle,
+                        "src": _src, "is_pub": _is_pub,
+                        "rs": _rs, "re": _re, "fold": _fold,
+                        "name": _st.get("name"),
+                    }
+                    await message.reply_text(
+                        "📂 **Destination pehle se hai**\n\n"
+                        f"Tumhara group `{_old_gtitle}` pehle se bana hua hai.\n\n"
+                        "**Files kahan upload karun?**\n"
+                        "• 📂 **Purana wala** — files usi group me jayengi\n"
+                        f"• 🆕 **Naya banao** — `{(_st.get('name') or 'VILLAN')} • Saved` naam se naya group banega\n\n"
+                        "Chuno 👇",
+                        parse_mode=enums.ParseMode.MARKDOWN,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📂 Purana wala", callback_data="dest_old"),
+                             InlineKeyboardButton("🆕 Naya banao", callback_data="dest_new")],
+                        ]),
+                    )
+                    return
                 _gid, _gnew, _gtitle = await _get_or_create_auto_group(
                     client, _ub3, user_id, _st.get("name"))
                 if not _gid:
@@ -8260,7 +8394,7 @@ async def message_dispatcher(client, message):
             except Exception:
                 _end = None
             if not _end:
-                await message.reply_text("❌ History nahi mili — source check karo, phir dobara `/batch` karo.")
+                await message.reply_text("❌ History nahi mili — source check karo, phir dobara Start Forwarding se karo.")
                 return
         if _end is None:
             _end = _start
@@ -8299,6 +8433,33 @@ async def message_dispatcher(client, message):
             else:
                 _ub2 = await get_userbot(user_id)
                 if _ub2 is not None:
+                    # v123: pehle se auto channel bana ho to POOCHO — purana
+                    # use karun ya naya banaun? (naya source ke naam se banega)
+                    _old_cid, _old_ctitle = _auto_dest_existing(user_id, "channel")
+                    if _old_cid:
+                        USER_STATES[user_id] = {
+                            "step": "WAITING_DEST_CHOICE", "kind": "channel",
+                            "old_id": _old_cid, "old_title": _old_ctitle,
+                            "src": _src, "is_pub": _is_pub,
+                            "start": _start, "end": _end,
+                            "total": total_files,
+                            "only_topic": _st.get("only_topic"),
+                            "name": _st.get("name"),
+                        }
+                        await message.reply_text(
+                            "📂 **Destination pehle se hai**\n\n"
+                            f"Tumhara channel `{_old_ctitle}` pehle se bana hua hai.\n\n"
+                            "**Files kahan upload karun?**\n"
+                            "• 📂 **Purana wala** — files usi channel me jayengi\n"
+                            f"• 🆕 **Naya banao** — `{(_st.get('name') or 'VILLAN')} • Saved` naam se naya channel banega\n\n"
+                            "Chuno 👇",
+                            parse_mode=enums.ParseMode.MARKDOWN,
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("📂 Purana wala", callback_data="dest_old"),
+                                 InlineKeyboardButton("🆕 Naya banao", callback_data="dest_new")],
+                            ]),
+                        )
+                        return
                     _dest_override, _auto_new, _auto_title = await _get_or_create_auto_dest(
                         client, _ub2, user_id, _st.get("name"))
                     if _dest_override:
@@ -8490,7 +8651,6 @@ async def main():
             BotCommand("start", "Bot start karo"),
             BotCommand("login", "Apne number se login"),
             BotCommand("logout", "Session khatam karo"),
-            BotCommand("batch", "Bulk extraction (range)"),
             BotCommand("create", "Naya group + folders banao"),
             BotCommand("mkchannels", "10 username se PUBLIC channels banao"),
             BotCommand("mychannels", "Tumhare channels ki list"),
@@ -8553,6 +8713,8 @@ async def main():
     print("👉 V119: FOOTER WAPAS — 5 dots har side, ● bari bari ping-pong blink", flush=True)
     print("👉 V120: USER PASTED CARD — poora 14-line card, border 24, footer 5 dots + blink", flush=True)
     print("👉 V121: SPINNER HEADER — typewriter ki jagah ◐◑◒◓ ghumta hai VILLAN ke pehle", flush=True)
+    print("👉 V122: FAIL FIX — khaali message par card nahi banega, fetch pehle", flush=True)
+    print("👉 V123: /batch HATA — batch sirf Start Forwarding se; pehle se auto dest ho to purana/naya poochhega", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
