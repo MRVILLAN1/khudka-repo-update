@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -367,7 +366,16 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # Clone mode me sawal nahi (clone hamesha naya group banata hai).
 # Choice WAITING_DEST_CHOICE state me save hoti hai; button dabane par
 # _resume_dest_choice batch wahi se shuru karta hai.
-VERSION = "v123"
+# v124 (2026-11-19, on v123): /check DIAGNOSTIC — user 5968218636 ke
+# batch me msg 6-369 sab NO MEDIA/TEXT se fail ho rahe the, jabki user
+# kehta hai unme video hai. Bot ko message MIL raha hai par usme na
+# media dikhta hai na text. /check <message link> ek message fetch karke
+# batayega: source ka naam/type, message khaali hai ya nahi, service
+# message hai ya nahi, media type, text/caption hai ya nahi, aur batch
+# isko lega ya skip karega. Isse pata chalega bot galat chat padh raha
+# hai ya message hi content-less aa raha hai. Saath me run_batch ab
+# shuru hote hi log me source ka naam/ID/type likhega.
+VERSION = "v124"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -3171,6 +3179,20 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg, pu
         return
     else:
         fetch_client = userbot
+
+    # v124: batch shuru hote hi log me source ka naam/ID/type likho —
+    # galat chat fetch ho rahi ho to turant pata chal jaye.
+    try:
+        _src_chat, _src_pub, _src_forum = await _resolve_batch_source(client, userbot, src_chat)
+        if _src_chat is not None:
+            _src_title = getattr(_src_chat, "title", None) or str(src_chat)
+            _src_type = getattr(_src_chat, "type", None)
+            _src_type = _src_type.value if _src_type is not None else "?"
+            print(f"[BATCH] source: '{_src_title}' ({_src_type}" + (" forum" if _src_forum else "") + f") id={src_chat}", flush=True)
+        else:
+            print(f"[BATCH] source: {src_chat} (resolve nahi hua)", flush=True)
+    except Exception as _e:
+        print(f"[BATCH] source log fail: {_e}", flush=True)
 
     ids = list(range(start_id, end_id + 1))
     total = len(ids)
@@ -6417,6 +6439,7 @@ async def help_handler(client, message):
         "• v121 — Header naya: typewriter ki jagah ghumta spinner (◐◑◒◓) VILLAN ke pehle.\n"
         "• v122 — Fail fix: khaali message par card nahi banega (fetch pehle), rate limit ka load kam.\n"
         "• v123 — /batch hata diya: batch ab sirf Start Forwarding se (button); pehle se auto channel/group ho to poochhega — purana wala ya naya banao (source ke naam se).\n"
+        "• v124 — /check diagnostic: ek message ka link do, bot batayega usme use kya dikhta hai (video/photo/text/khaali) + batch shuru hote hi log me source ka naam aayega.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -6492,6 +6515,81 @@ async def batch_start_handler(client, message):
         "• `/start` karo\n"
         "• **🚀 Start Forwarding Now** dabao\n"
         "• Public ya Private chuno, phir source ka link bhejo.")
+
+
+@app.on_message(filters.command("check") & filters.private)
+async def check_handler(client, message):
+    """v124: /check — ek message ka link do, bot batayega use kya dikhta hai.
+    Batch me NO MEDIA/TEXT fail ho raha ho to pehle /check se dekho:
+    video dikhta hai ya nahi, aur bot kaun si chat padh raha hai."""
+    uid = message.chat.id
+    if not await _has_joined(uid, force=True):
+        await _send_join_wall(message)
+        return
+    if not _is_allowed(uid):
+        await message.reply_text("⛔ Access denied.")
+        return
+    arg = (message.text or "").replace("/check", "", 1).strip()
+    if not arg:
+        await message.reply_text(
+            "🔍 **/check ka use:**\n"
+            "Ek message ka link bhejo, jaise:\n"
+            "`/check https://t.me/c/1234567890/6`\n\n"
+            "Bot batayega us message me use kya dikhta hai — "
+            "video, photo, text, ya khaali.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+        return
+    chat_id, preset = _parse_channel_input(arg)
+    if chat_id is None or not preset:
+        await message.reply_text(
+            "❌ Link samajh nahi aaya.\n"
+            "Message ka poora link bhejo, jaise:\n"
+            "`/check https://t.me/c/1234567890/6`",
+            parse_mode=enums.ParseMode.MARKDOWN)
+        return
+    userbot = await get_userbot(uid)
+    is_public = isinstance(chat_id, str)
+    fetch_client = client if is_public else userbot
+    if fetch_client is None:
+        await message.reply_text("❌ Login required. Use /login first.")
+        return
+    # Source ka naam/type nikalo — yehi batayega bot kaun si chat padh raha hai.
+    chat, _is_pub, is_forum = await _resolve_batch_source(client, userbot, chat_id)
+    ctitle = getattr(chat, "title", None) or str(chat_id)
+    ctitle = ctitle.replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("`", "")
+    ctype = getattr(chat, "type", None)
+    ctype = ctype.value if ctype is not None else "?"
+    try:
+        m = await fetch_client.get_messages(chat_id, preset)
+    except Exception as e:
+        await message.reply_text(f"❌ Fetch nahi hua: `{e}`")
+        return
+    if isinstance(m, list):
+        m = m[0] if m else None
+    if not m:
+        await message.reply_text(f"❌ Message {preset} mila hi nahi.")
+        return
+    media = getattr(m, "media", None)
+    media_s = media.value if media is not None else "—"
+    has_text = bool(getattr(m, "text", None))
+    has_cap = bool(getattr(m, "caption", None))
+    is_empty = bool(getattr(m, "empty", False))
+    is_service = getattr(m, "service", None) is not None
+    would_take = bool(media) or has_text
+    verdict = ("✅ Batch isko lega" if would_take
+               else "❌ Batch isko SKIP karega (NO MEDIA/TEXT)")
+    await message.reply_text(
+        f"🔍 **/check result — msg {preset}**\n\n"
+        f"**Source:** {ctitle}\n"
+        f"**Type:** {ctype}" + (" (forum)" if is_forum else "") + "\n"
+        f"**Chat ID:** `{chat_id}`\n\n"
+        f"**Message khaali hai:** {'haan' if is_empty else 'nahi'}\n"
+        f"**Service message hai:** {'haan' if is_service else 'nahi'}\n"
+        f"**Media:** {media_s}\n"
+        f"**Text hai:** {'haan' if has_text else 'nahi'}\n"
+        f"**Caption hai:** {'haan' if has_cap else 'nahi'}\n\n"
+        f"{verdict}",
+        parse_mode=enums.ParseMode.MARKDOWN)
 
 
 @app.on_message(filters.command("clone") & filters.private)
@@ -7557,7 +7655,7 @@ async def sendall_media_handler(client, message):
         ["start", "batch", "cancel", "login", "logout", "settings",
          "allow", "unallow", "users", "paid", "plan", "help", "buy",
          "mkchannels", "mychannels", "sendall", "free", "makeadmin",
-         "addchannel", "sendallrange", "public", "clone"]
+         "addchannel", "sendallrange", "public", "clone", "check"]
     )
 )
 async def message_dispatcher(client, message):
@@ -8667,6 +8765,7 @@ async def main():
             BotCommand("buy", "Premium kharido"),
             BotCommand("help", "Usage guide"),
             BotCommand("cancel", "Chal raha task roko"),
+            BotCommand("check", "Ek message check karo — video dikhta hai ya nahi"),
         ])
         print("👉 Bot command menu set ho gaya", flush=True)
     except Exception as e:
@@ -8715,6 +8814,7 @@ async def main():
     print("👉 V121: SPINNER HEADER — typewriter ki jagah ◐◑◒◓ ghumta hai VILLAN ke pehle", flush=True)
     print("👉 V122: FAIL FIX — khaali message par card nahi banega, fetch pehle", flush=True)
     print("👉 V123: /batch HATA — batch sirf Start Forwarding se; pehle se auto dest ho to purana/naya poochhega", flush=True)
+    print("👉 V124: /check DIAGNOSTIC — ek message link do, bot batayega use kya dikhta hai (media/text/khaali)", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
