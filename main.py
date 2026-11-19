@@ -387,7 +387,13 @@ logging.getLogger("asyncio").setLevel(logging.ERROR)
 # se asal media type bhi dikhata hai: MessageMediaUnsupported mile to
 # saaf likhega ki ye PAID/LOCKED media hai aur bot bina unlock kiye
 # download nahi kar sakta.
-VERSION = "v125"
+# v126 (2026-11-20, on v125): /check chalane ki zaroorat nahi — batch
+# khud pehli NO MEDIA/TEXT fail par raw media type log me likhega
+# ([RAW-MEDIA] msg X: raw media type = ...). User ne bataya video
+# Telegram me CHALTA hai par bot ko nahi dikhta, PDF nikal jata hai.
+# Iska matlab video ka media type hi alag hai; ab log se hi pata
+# chalega wo kya hai — paid/locked hai ya kuch aur.
+VERSION = "v126"
 # v91: user ne kaha "waisa hi krdo" — matlab chat me Downloading ID kabhi
 # nahi aana chahiye, jaise v51 se pehle tha. v90 ne pehli file ka prefetch
 # download silent kiya tha, par prefetch fail hone par upload_one ka
@@ -1188,6 +1194,48 @@ async def _fetch_chunk(user_client, src_chat, id_chunk):
     return None
 
 
+# v126: NO MEDIA/TEXT ka asal reason batch ke log me hi dikhao. User ne
+# bataya video Telegram me CHALTA hai par bot ko nahi dikhta, aur PDF
+# nikal jata hai — iska matlab video ka media type hi alag hai. /check
+# (v125) se pata chalta, par user ko alag command chalana padta hai.
+# Isliye fetch_one jab NO MEDIA/TEXT de to pehli baar (har source ke
+# liye sirf ek baar) raw API se asal media type nikal kar log karo.
+_RAW_MEDIA_CHECKED = set()
+
+
+async def _log_raw_media_once(user_client, src_chat, msg_id):
+    """Pehli NO MEDIA/TEXT fail par raw API se asal media type log karo.
+    Sirf ek baar per source — har file par API call nahi hoti."""
+    if user_client is None:
+        return
+    key = str(src_chat)
+    if key in _RAW_MEDIA_CHECKED:
+        return
+    _RAW_MEDIA_CHECKED.add(key)
+    try:
+        from pyrogram import raw as _praw
+        _peer = await user_client.resolve_peer(src_chat)
+        if isinstance(_peer, _praw.types.InputPeerChannel):
+            _rpc = _praw.functions.channels.GetMessages(
+                channel=_peer, id=[_praw.types.InputMessageID(id=msg_id)])
+        else:
+            _rpc = _praw.functions.messages.GetMessages(
+                id=[_praw.types.InputMessageID(id=msg_id)])
+        _res = await user_client.invoke(_rpc)
+        _rms = getattr(_res, "messages", []) or []
+        if _rms:
+            _rm = _rms[0]
+            _rm_media = getattr(_rm, "media", None)
+            _rm_type = type(_rm_media).__name__ if _rm_media is not None else "None"
+            print(f"[RAW-MEDIA] msg {msg_id}: raw media type = {_rm_type}", flush=True)
+            if _rm_type == "MessageMediaUnsupported":
+                print("[RAW-MEDIA] Ye PAID/LOCKED media hai (ya naya type) — is purane Pyrogram (Layer 158) ko nahi dikhta. Telegram me is par Stars wala lock dikhega.", flush=True)
+        else:
+            print(f"[RAW-MEDIA] msg {msg_id}: raw message hi nahi mila", flush=True)
+    except Exception as _e:
+        print(f"[RAW-MEDIA] msg {msg_id}: raw check fail: {_e}", flush=True)
+
+
 async def fetch_one(user_client, src_chat, msg_id, preloaded=None):
     """Message ka metadata + file_id lao. Download MAT karo (fast path ke liye).
     preloaded: chunk-fetch se aaya Message object (network call skip hoti hai),
@@ -1240,7 +1288,11 @@ async def fetch_one(user_client, src_chat, msg_id, preloaded=None):
             # All 3 attempts failed
             print(f"Fetch failed after 3 attempts on {msg_id}: {last_err}", flush=True)
             return None
-    return _info_from_msg(target_msg, msg_id)
+    _info = _info_from_msg(target_msg, msg_id)
+    if _info is None:
+        # v126: NO MEDIA/TEXT — pehli baar raw media type log me likho
+        await _log_raw_media_once(user_client, src_chat, msg_id)
+    return _info
 
 
 def _info_from_msg(target_msg, msg_id):
@@ -6453,6 +6505,7 @@ async def help_handler(client, message):
         "• v123 — /batch hata diya: batch ab sirf Start Forwarding se (button); pehle se auto channel/group ho to poochhega — purana wala ya naya banao (source ke naam se).\n"
         "• v124 — /check diagnostic: ek message ka link do, bot batayega usme use kya dikhta hai (video/photo/text/khaali) + batch shuru hote hi log me source ka naam aayega.\n"
         "• v125 — /check ab RAW media type bhi dikhata hai: paid/locked video (Stars) MessageMediaUnsupported aayega, to saaf pata chalega bot use kyun nahi dekh sakta.\n"
+        "• v126 — batch khud pehli NO MEDIA/TEXT fail par raw media type log me likhega ([RAW-MEDIA]), /check chalane ki zaroorat nahi.\n"
         "\n"
         "1. /login — Apne number se sign in karo (OTP aayega, phir 2FA ho to wo bhi). Bina login ke private groups/channels nahi khulenge.\n"
         "2. /logout — Session khatam karo.\n"
@@ -8864,6 +8917,7 @@ async def main():
     print("👉 V123: /batch HATA — batch sirf Start Forwarding se; pehle se auto dest ho to purana/naya poochhega", flush=True)
     print("👉 V124: /check DIAGNOSTIC — ek message link do, bot batayega use kya dikhta hai (media/text/khaali)", flush=True)
     print("👉 V125: /check RAW MEDIA — paid/locked video ka asal type dikhega (MessageMediaUnsupported = Stars lock)", flush=True)
+    print("👉 V126: batch khud pehli NO MEDIA/TEXT fail par raw media type log karega ([RAW-MEDIA])", flush=True)
     if not OWNER_ID and SESSION_STRING:
         print("⚠️ OWNER_ID set nahi hai — owner userbot fallback BAND hai "
               "(strangers owner account par download na chala payen). Apni "
